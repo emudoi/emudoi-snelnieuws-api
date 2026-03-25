@@ -1,5 +1,6 @@
 val ScalatraVersion = "2.8.4"
 val DoobieVersion = "1.0.0-RC4"
+val FlywayVersion = "9.22.3"
 
 ThisBuild / scalaVersion := "2.13.12"
 ThisBuild / organization := "com.snelnieuws"
@@ -32,6 +33,9 @@ lazy val root = (project in file("."))
 
       // Config
       "com.typesafe" % "config" % "1.4.2",
+
+      // Flyway
+      "org.flywaydb" % "flyway-core" % FlywayVersion,
 
       // Testing
       "org.scalatra" %% "scalatra-scalatest" % ScalatraVersion % "test"

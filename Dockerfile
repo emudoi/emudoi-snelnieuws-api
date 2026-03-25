@@ -30,8 +30,5 @@ RUN mkdir -p src/main/webapp/WEB-INF
 EXPOSE 8080
 
 ENV PORT=8080
-ENV DATABASE_URL=jdbc:postgresql://db:5432/snelnieuws
-ENV DATABASE_USER=postgres
-ENV DATABASE_PASSWORD=postgres
 
 CMD ["java", "-jar", "snelnieuws-api.jar"]

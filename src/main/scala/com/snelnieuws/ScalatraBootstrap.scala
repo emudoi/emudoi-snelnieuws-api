@@ -7,8 +7,8 @@ import javax.servlet.ServletContext
 
 class ScalatraBootstrap extends LifeCycle {
   override def init(context: ServletContext): Unit = {
-    // Initialize database schema
-    Database.initSchema()
+    // Run Flyway database migrations
+    Database.migrate()
 
     // Mount the API servlet
     context.mount(new NewsServlet, "/*")
