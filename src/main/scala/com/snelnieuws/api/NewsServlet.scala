@@ -13,9 +13,9 @@ class NewsServlet extends ScalatraServlet with JacksonJsonSupport {
     contentType = formats("json")
   }
 
-  // GET /v2/everything - matches News API format
+  // GET /everything
   // Query params: q (search query), sortBy (publishedAt)
-  get("/v2/everything") {
+  get("/everything") {
     val query = params.getOrElse("q", "")
     val limit = params.getOrElse("pageSize", "100").toInt
 
@@ -35,9 +35,9 @@ class NewsServlet extends ScalatraServlet with JacksonJsonSupport {
     )
   }
 
-  // GET /v2/top-headlines - matches News API format
+  // GET /top-headlines
   // Query params: category, country (ignored)
-  get("/v2/top-headlines") {
+  get("/top-headlines") {
     val category = params.getOrElse("category", "")
     val limit = params.getOrElse("pageSize", "100").toInt
 
