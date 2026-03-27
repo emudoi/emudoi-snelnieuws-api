@@ -35,6 +35,8 @@ object JettyLauncher {
     } catch {
       case e: Exception =>
         logger.error("Failed to start SnelNieuws API", e)
+        System.err.println(s"FATAL: Failed to start SnelNieuws API: ${e.getMessage}")
+        e.printStackTrace(System.err)
         System.exit(1)
     }
   }

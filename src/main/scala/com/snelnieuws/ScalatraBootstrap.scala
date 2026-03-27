@@ -17,7 +17,8 @@ class ScalatraBootstrap extends LifeCycle {
       Database.migrate()
     } catch {
       case e: Exception =>
-        logger.error("Database migration failed — app will start but DB features may be unavailable", e)
+        logger.error("Database migration failed — cannot start without tables", e)
+        throw e
     }
 
     context.mount(new NewsServlet, "/*")
