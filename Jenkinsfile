@@ -102,7 +102,7 @@ pipeline {
                     sshUserPrivateKey(credentialsId: 'APP_NODE_SSH_KEY', keyFileVariable: 'SSH_KEY_FILE')
                 ]) {
                     sh '''
-                        APP_NODE_HOST="178.104.116.73"
+                        APP_NODE_HOST=$(getent hosts api.snel.emudoi.com | awk '{print $1}')
                         SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
                         echo "[emudoi] Removing old container if exists..."

@@ -19,3 +19,5 @@ Thumbs.db
 # Environment
 .env
 emudoi_infra
+local_run.sh
+emudoi_infra_only
