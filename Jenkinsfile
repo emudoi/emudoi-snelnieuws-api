@@ -11,7 +11,7 @@ pipeline {
 
     environment {
         DOCKER_REGISTRY = 'ghcr.io'
-        IMAGE_NAME = "${DOCKER_REGISTRY}/${env.GITHUB_REPOSITORY_OWNER ?: 'emudoi'}/snelnieuwsapi"
+        IMAGE_NAME = "${DOCKER_REGISTRY}/${env.GITHUB_REPOSITORY_OWNER ?: 'emudoi'}/emudoi-snelnieuws-api"
         IMAGE_TAG = "${env.GIT_COMMIT?.take(7) ?: 'latest'}"
     }
 
@@ -107,16 +107,16 @@ pipeline {
 
                         echo "[emudoi] Removing old container if exists..."
                         ssh ${SSH_OPTS} -i "${SSH_KEY_FILE}" root@${APP_NODE_HOST} \
-                            "docker rm -f snel-nieuws-api 2>/dev/null || true"
+                            "docker rm -f emudoi-snelnieuws-api 2>/dev/null || true"
 
                         echo "[emudoi] Pulling latest image on app node..."
                         ssh ${SSH_OPTS} -i "${SSH_KEY_FILE}" root@${APP_NODE_HOST} \
                             "echo '${GITHUB_TOKEN}' | docker login ghcr.io -u emudoi --password-stdin && \
-                             docker compose -f /opt/emudoi/docker-compose.yml pull snel-nieuws-api"
+                             docker compose -f /opt/emudoi/docker-compose.yml pull emudoi-snelnieuws-api"
 
                         echo "[emudoi] Starting updated containers..."
                         ssh ${SSH_OPTS} -i "${SSH_KEY_FILE}" root@${APP_NODE_HOST} \
-                            "docker compose -f /opt/emudoi/docker-compose.yml up -d snel-nieuws-api"
+                            "docker compose -f /opt/emudoi/docker-compose.yml up -d emudoi-snelnieuws-api"
 
                         echo "[emudoi] Waiting for health check..."
                         sleep 15
