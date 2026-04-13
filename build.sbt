@@ -7,7 +7,7 @@ ThisBuild / organization := "com.snelnieuws"
 
 lazy val root = (project in file("."))
   .settings(
-    name := "SnelNieuwsApi",
+    name := "emudoi-snelnieuws-api",
     version := "0.1.0-SNAPSHOT",
     mainClass := Some("com.snelnieuws.JettyLauncher"),
     libraryDependencies ++= Seq(
@@ -26,7 +26,7 @@ lazy val root = (project in file("."))
       // Test
       "org.scalatra"            %% "scalatra-scalatest"    % ScalatraVersion % Test
     ),
-    assembly / assemblyJarName := "snelnieuws-api.jar",
+    assembly / assemblyJarName := "emudoi-snelnieuws-api.jar",
     assembly / assemblyMergeStrategy := {
       case PathList("META-INF", "services", _*) => MergeStrategy.concat
       case PathList("META-INF", _*)             => MergeStrategy.discard
