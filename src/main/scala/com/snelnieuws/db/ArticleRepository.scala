@@ -75,6 +75,16 @@ object ArticleRepository {
     sql"DELETE FROM articles WHERE published_at < $cutoff".update.run.transact(xa).unsafeRunSync()
   }
 
+  /** Distinct non-null, non-empty categories that currently have at least one article. */
+  def findDistinctCategories(): List[String] = {
+    sql"""
+      SELECT DISTINCT category
+      FROM articles
+      WHERE category IS NOT NULL AND category <> ''
+      ORDER BY category
+    """.query[String].to[List].transact(xa).unsafeRunSync()
+  }
+
   /**
    * Insert-or-update an article keyed on `title`, using a summarized-article event
    * from the ingestion-api. Title is the dedup key — matches the upstream

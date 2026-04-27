@@ -34,4 +34,7 @@ object ArticleService {
 
   def delete(id: Long): Int =
     ArticleRepository.delete(id)
+
+  def findCategories(): List[String] =
+    ArticleRepository.findDistinctCategories()
 }

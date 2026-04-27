@@ -78,6 +78,12 @@ class NewsServlet extends ScalatraServlet with JacksonJsonSupport {
     else NotFound(Map("error" -> "Article not found"))
   }
 
+  // GET /categories - List categories that currently have at least one article
+  get("/categories") {
+    val categories = ArticleService.findCategories()
+    Map("categories" -> categories)
+  }
+
   // App config
   get("/app/config") {
     Map("minVersion" -> "1.2.0")
