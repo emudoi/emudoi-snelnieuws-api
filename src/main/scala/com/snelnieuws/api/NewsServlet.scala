@@ -93,4 +93,30 @@ class NewsServlet extends ScalatraServlet with JacksonJsonSupport {
   get("/health") {
     Map("status" -> "ok", "service" -> "SnelNieuws API")
   }
+
+  // Privacy policy — referenced from App Store listing and in-app menu
+  get("/privacy") {
+    serveStatic("static/privacy.html")
+  }
+
+  // Support page — referenced from App Store listing
+  get("/support") {
+    serveStatic("static/support.html")
+  }
+
+  private def serveStatic(resourcePath: String): Any = {
+    Option(getClass.getClassLoader.getResourceAsStream(resourcePath)) match {
+      case Some(stream) =>
+        try {
+          val bytes = stream.readAllBytes()
+          contentType = "text/html; charset=utf-8"
+          response.setHeader("Cache-Control", "public, max-age=3600")
+          new String(bytes, "UTF-8")
+        } finally {
+          stream.close()
+        }
+      case None =>
+        NotFound(Map("error" -> s"Resource $resourcePath not found"))
+    }
+  }
 }
