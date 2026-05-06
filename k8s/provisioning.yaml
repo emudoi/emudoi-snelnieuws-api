@@ -27,10 +27,14 @@ spec:
     clusterScope: true
   arguments:
     parameters:
+      # Single shared `emudoi` postgres role + the legacy `snelnieuws` DB
+      # (459 articles migrated from emudoi-postgres). The per-service
+      # `snelnieuws_api` role + DB created by earlier workflow runs held
+      # only flyway sample data + post-rebuild stragglers — orphaned.
       - name: db
-        value: snelnieuws_api
+        value: snelnieuws
       - name: db-user
-        value: snelnieuws_api
+        value: emudoi
       - name: vault-path
         value: snelnieuws/api
       - name: vault-role
