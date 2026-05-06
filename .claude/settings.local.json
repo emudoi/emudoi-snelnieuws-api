@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/pranjutgogoi/workspace/emudoi/**)",
+      "Bash(git checkout *)",
+      "Bash(grep -v -E \"^--$|^$\")",
+      "Bash(sbt --error compile)",
+      "Bash(sbt compile *)",
+      "Bash(sbt \"clean; compile\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(kubectl config *)",
+      "Bash(kubectl get *)",
+      "Bash(kubectl -n vault cp /Users/pranjutgogoi/workspace/emudoi/emudoi-snelnieuws-ios/AuthKey_K9MVS7XY7S.p8 vault-0:/tmp/apns.p8)",
+      "Bash(kubectl -n vault exec vault-0 -- ls -la /tmp/apns.p8)",
+      "Bash(chmod +x /Users/pranjutgogoi/workspace/emudoi/emudoi-snelnieuws-api/scripts/bootstrap-notification-secrets.sh)",
+      "Bash(bash -n /Users/pranjutgogoi/workspace/emudoi/emudoi-snelnieuws-api/scripts/bootstrap-notification-secrets.sh)",
+      "Bash(git fetch *)",
+      "Bash(git merge *)",
+      "Bash(git commit *)"
+    ]
+  }
+}
