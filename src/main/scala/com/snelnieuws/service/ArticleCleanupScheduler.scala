@@ -1,6 +1,6 @@
 package com.snelnieuws.service
 
-import com.snelnieuws.db.ArticleRepository
+import com.snelnieuws.repository.ArticleRepository
 import org.slf4j.LoggerFactory
 
 import java.time.OffsetDateTime
@@ -12,7 +12,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Driven by a single-thread daemon scheduler — survives transient DB errors by logging
  * and waiting for the next tick.
  */
-class ArticleCleanupScheduler(retentionHours: Long, intervalMinutes: Long) {
+class ArticleCleanupScheduler(
+  articleRepository: ArticleRepository,
+  retentionHours: Long,
+  intervalMinutes: Long
+) {
 
   private val logger  = LoggerFactory.getLogger(classOf[ArticleCleanupScheduler])
   private val started = new AtomicBoolean(false)
@@ -57,13 +61,13 @@ class ArticleCleanupScheduler(retentionHours: Long, intervalMinutes: Long) {
   }
 
   private def runOnce(): Unit = {
-    try {
-      val cutoff  = OffsetDateTime.now().minusHours(retentionHours)
-      val deleted = ArticleRepository.deletePublishedBefore(cutoff)
-      if (deleted > 0) logger.info(s"Cleanup: deleted $deleted article(s) older than $cutoff")
-      else logger.debug(s"Cleanup: no articles older than $cutoff")
-    } catch {
-      case e: Exception =>
+    val cutoff = OffsetDateTime.now().minusHours(retentionHours)
+    articleRepository.deletePublishedBefore(cutoff) match {
+      case Right(deleted) if deleted > 0 =>
+        logger.info(s"Cleanup: deleted $deleted article(s) older than $cutoff")
+      case Right(_) =>
+        logger.debug(s"Cleanup: no articles older than $cutoff")
+      case Left(e) =>
         logger.error(s"Article cleanup tick failed: ${e.getMessage}", e)
     }
   }

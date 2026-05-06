@@ -1,6 +1,6 @@
 package com.snelnieuws.service
 
-import com.snelnieuws.db.ArticleRepository
+import com.snelnieuws.repository.ArticleRepository
 import com.snelnieuws.kafka.SummarizedImportKafkaConfig
 import com.snelnieuws.model.SummarizedArticleExportEvent
 import io.circe.parser.decode
@@ -15,7 +15,10 @@ import java.util.{Collections, Properties}
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.jdk.CollectionConverters._
 
-class SummarizedArticleConsumer(kafkaConfig: SummarizedImportKafkaConfig) {
+class SummarizedArticleConsumer(
+  articleRepository: ArticleRepository,
+  kafkaConfig: SummarizedImportKafkaConfig
+) {
 
   import SummarizedArticleConsumer._
 
@@ -95,11 +98,10 @@ class SummarizedArticleConsumer(kafkaConfig: SummarizedImportKafkaConfig) {
     }
     decode[SummarizedArticleExportEvent](payload) match {
       case Right(event) =>
-        try {
-          ArticleRepository.upsertByTitle(event.article)
-          logger.info(s"Upserted summarized article title=${event.article.title}")
-        } catch {
-          case e: Exception =>
+        articleRepository.upsertByTitle(event.article) match {
+          case Right(_) =>
+            logger.info(s"Upserted summarized article title=${event.article.title}")
+          case Left(e) =>
             // Don't poison the partition — log and skip. Re-throwing here would block this
             // partition forever since we'd never advance the offset.
             logger.error(

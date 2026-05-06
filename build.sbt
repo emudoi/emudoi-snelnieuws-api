@@ -34,8 +34,14 @@ lazy val root = (project in file("."))
       // to Apple, no Firebase indirection.
       "com.eatthepath"           % "pushy"                 % "0.15.4",
       // Test
-      "org.scalatra"            %% "scalatra-scalatest"    % ScalatraVersion % Test
+      "org.scalatra"            %% "scalatra-scalatest"              % ScalatraVersion % Test,
+      "org.scalatest"           %% "scalatest"                       % "3.2.17"        % Test,
+      "com.dimafeng"            %% "testcontainers-scala-scalatest"  % "0.41.0"        % Test,
+      "com.dimafeng"            %% "testcontainers-scala-postgresql" % "0.41.0"        % Test
     ),
+    // All test classes share one Postgres testcontainer + one Database singleton —
+    // parallel suites would race on inserts and break "as_of_article_id" invariants.
+    Test / parallelExecution := false,
     assembly / assemblyJarName := "emudoi-snelnieuws-api.jar",
     assembly / assemblyMergeStrategy := {
       case PathList("META-INF", "services", _*) => MergeStrategy.concat

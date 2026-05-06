@@ -1,10 +1,52 @@
 package com.snelnieuws.service
 
-import com.snelnieuws.db.ArticleRepository
+import com.snelnieuws.repository.ArticleRepository
 import com.snelnieuws.model.{Article, ArticleCreate, ArticleRow}
 
 import scala.collection.mutable
 import scala.util.Random
+
+class ArticleService(repository: ArticleRepository) {
+
+  import ArticleService._
+
+  def findAll(limit: Int = 100): Either[Throwable, List[Article]] =
+    repository.findAll(limit).map(_.map(toArticle)).map(interleaveBySource)
+
+  def findByCategory(category: String, limit: Int = 100): Either[Throwable, List[Article]] =
+    repository.findByCategory(category, limit).map(_.map(toArticle)).map(interleaveBySource)
+
+  def search(query: String, limit: Int = 100): Either[Throwable, List[Article]] =
+    repository.search(query, limit).map(_.map(toArticle)).map(interleaveBySource)
+
+  def create(article: ArticleCreate): Either[Throwable, Article] =
+    repository.create(article).map(toArticle)
+
+  def findById(id: Long): Either[Throwable, Option[Article]] =
+    repository.findById(id).map(_.map(toArticle))
+
+  def delete(id: Long): Either[Throwable, Int] =
+    repository.delete(id)
+
+  def findCategories(): Either[Throwable, List[String]] =
+    repository.findDistinctCategories()
+
+  // /everything route logic — empty / "news" → all; otherwise try category, fall back to search.
+  def findEverything(query: String, limit: Int = 100): Either[Throwable, List[Article]] =
+    if (query.isEmpty || query == "news") {
+      findAll(limit)
+    } else {
+      findByCategory(query, limit).flatMap { byCategory =>
+        if (byCategory.nonEmpty) Right(byCategory)
+        else search(query, limit)
+      }
+    }
+
+  // /top-headlines route logic — empty category → all; otherwise filter by category.
+  def findTopHeadlines(category: String, limit: Int = 100): Either[Throwable, List[Article]] =
+    if (category.isEmpty) findAll(limit)
+    else findByCategory(category, limit)
+}
 
 object ArticleService {
 
@@ -56,25 +98,4 @@ object ArticleService {
     }
     result.toList
   }
-
-  def findAll(limit: Int = 100): List[Article] =
-    interleaveBySource(ArticleRepository.findAll(limit).map(toArticle))
-
-  def findByCategory(category: String, limit: Int = 100): List[Article] =
-    interleaveBySource(ArticleRepository.findByCategory(category, limit).map(toArticle))
-
-  def search(query: String, limit: Int = 100): List[Article] =
-    interleaveBySource(ArticleRepository.search(query, limit).map(toArticle))
-
-  def create(article: ArticleCreate): Article =
-    toArticle(ArticleRepository.create(article))
-
-  def findById(id: Long): Option[Article] =
-    ArticleRepository.findById(id).map(toArticle)
-
-  def delete(id: Long): Int =
-    ArticleRepository.delete(id)
-
-  def findCategories(): List[String] =
-    ArticleRepository.findDistinctCategories()
 }

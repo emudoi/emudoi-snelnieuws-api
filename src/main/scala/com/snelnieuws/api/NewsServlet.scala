@@ -1,98 +1,114 @@
 package com.snelnieuws.api
 
+import com.snelnieuws.model.{ArticleCreate, NewsFetchResponse, SubscribeRequest}
+import com.snelnieuws.service.{ArticleService, DispatchOutcome, NotificationService}
+import org.json4s.{DefaultFormats, Formats, MappingException}
 import org.scalatra._
-import org.scalatra.json._
-import org.json4s.{DefaultFormats, Formats}
-import com.snelnieuws.service.{ApnsMessagingService, ArticleService}
-import com.snelnieuws.db.{ArticleRepository, NotificationDispatchRepository, NotificationSubscriptionRepository}
-import com.snelnieuws.model.{
-  ArticleCreate,
-  DispatchResponse,
-  NewsFetchResponse,
-  SubscribeRequest
-}
+import org.scalatra.json.JacksonJsonSupport
+import org.slf4j.LoggerFactory
 
-class NewsServlet(notificationsEnabled: Boolean, notificationsApiKey: String)
-    extends ScalatraServlet
+class NewsServlet(
+  articleService: ArticleService,
+  notificationService: NotificationService,
+  notificationsApiKey: String
+) extends ScalatraServlet
     with JacksonJsonSupport {
+
   protected implicit lazy val jsonFormats: Formats = DefaultFormats
+
+  private val logger = LoggerFactory.getLogger(classOf[NewsServlet])
 
   before() {
     contentType = formats("json")
   }
 
-  // GET /everything
-  // Query params: q (search query), sortBy (publishedAt)
+  error {
+    case e: Exception =>
+      logger.error(s"Unhandled error: ${e.getMessage}", e)
+      InternalServerError(Map("error" -> "Internal server error"))
+  }
+
+  // GET /everything — q, pageSize
   get("/everything") {
     val query = params.getOrElse("q", "")
     val limit = params.getOrElse("pageSize", "100").toInt
-
-    val articles = if (query.isEmpty || query == "news") {
-      ArticleService.findAll(limit)
-    } else {
-      // First try category, then search
-      val byCategory = ArticleService.findByCategory(query, limit)
-      if (byCategory.nonEmpty) byCategory
-      else ArticleService.search(query, limit)
+    articleService.findEverything(query, limit) match {
+      case Right(articles) =>
+        NewsFetchResponse(status = "ok", totalResults = articles.length, articles = articles)
+      case Left(e) =>
+        InternalServerError(Map("error" -> s"Failed to load articles: ${e.getMessage}"))
     }
-
-    NewsFetchResponse(
-      status = "ok",
-      totalResults = articles.length,
-      articles = articles
-    )
   }
 
-  // GET /top-headlines
-  // Query params: category, country (ignored)
+  // GET /top-headlines — category, pageSize
   get("/top-headlines") {
     val category = params.getOrElse("category", "")
-    val limit = params.getOrElse("pageSize", "100").toInt
-
-    val articles = if (category.isEmpty) {
-      ArticleService.findAll(limit)
-    } else {
-      ArticleService.findByCategory(category, limit)
+    val limit    = params.getOrElse("pageSize", "100").toInt
+    articleService.findTopHeadlines(category, limit) match {
+      case Right(articles) =>
+        NewsFetchResponse(status = "ok", totalResults = articles.length, articles = articles)
+      case Left(e) =>
+        InternalServerError(Map("error" -> s"Failed to load headlines: ${e.getMessage}"))
     }
-
-    NewsFetchResponse(
-      status = "ok",
-      totalResults = articles.length,
-      articles = articles
-    )
   }
 
-  // POST /articles - Create new article
+  // POST /articles
   post("/articles") {
-    val article = parsedBody.extract[ArticleCreate]
-    val created = ArticleService.create(article)
-    Created(created)
-  }
-
-  // GET /articles/:id - Get single article
-  get("/articles/:id") {
-    val id = params("id").toLong
-    ArticleService.findById(id) match {
-      case Some(article) => article
-      case None => NotFound(Map("error" -> "Article not found"))
+    try {
+      val article = parsedBody.extract[ArticleCreate]
+      articleService.create(article) match {
+        case Right(created) => Created(created)
+        case Left(e) =>
+          InternalServerError(Map("error" -> s"Failed to create article: ${e.getMessage}"))
+      }
+    } catch {
+      case e: MappingException =>
+        BadRequest(Map("error" -> s"Invalid request body: ${e.getMessage}"))
     }
   }
 
-  // DELETE /articles/:id - Delete article
+  // GET /articles/:id
+  get("/articles/:id") {
+    try {
+      val id = params("id").toLong
+      articleService.findById(id) match {
+        case Right(Some(article)) => article
+        case Right(None)          => NotFound(Map("error" -> "Article not found"))
+        case Left(e) =>
+          InternalServerError(Map("error" -> s"Failed to load article: ${e.getMessage}"))
+      }
+    } catch {
+      case _: NumberFormatException =>
+        BadRequest(Map("error" -> s"Invalid ID format: '${params("id")}' — expected a number"))
+    }
+  }
+
+  // DELETE /articles/:id
   delete("/articles/:id") {
-    val id = params("id").toLong
-    val deleted = ArticleService.delete(id)
-    if (deleted > 0) NoContent()
-    else NotFound(Map("error" -> "Article not found"))
+    try {
+      val id = params("id").toLong
+      articleService.delete(id) match {
+        case Right(rows) if rows > 0 => NoContent()
+        case Right(_)                => NotFound(Map("error" -> "Article not found"))
+        case Left(e) =>
+          InternalServerError(Map("error" -> s"Failed to delete article: ${e.getMessage}"))
+      }
+    } catch {
+      case _: NumberFormatException =>
+        BadRequest(Map("error" -> s"Invalid ID format: '${params("id")}' — expected a number"))
+    }
   }
 
-  // GET /categories - List categories that currently have at least one article
+  // GET /categories
   get("/categories") {
-    val categories = ArticleService.findCategories()
-    Map("categories" -> categories)
+    articleService.findCategories() match {
+      case Right(categories) => Map("categories" -> categories)
+      case Left(e) =>
+        InternalServerError(Map("error" -> s"Failed to load categories: ${e.getMessage}"))
+    }
   }
 
-  // App config
+  // GET /app/config
   get("/app/config") {
     Map("minVersion" -> "1.2.0")
   }
@@ -101,74 +117,51 @@ class NewsServlet(notificationsEnabled: Boolean, notificationsApiKey: String)
   // (and on any later frequency change or token rotation). Idempotent upsert
   // keyed on deviceId. No auth: this is keyed by the device's stable UUID.
   post("/notifications/subscribe") {
-    val req = parsedBody.extract[SubscribeRequest]
-    if (req.deviceId.trim.isEmpty || req.apnsToken.trim.isEmpty) {
-      BadRequest(Map("error" -> "deviceId and apnsToken are required"))
-    } else if (req.frequency < 1 || req.frequency > 4) {
-      BadRequest(Map("error" -> "frequency must be between 1 and 4"))
-    } else {
-      NotificationSubscriptionRepository.upsert(req.deviceId, req.apnsToken, req.frequency)
-      Map("ok" -> true)
+    try {
+      val req = parsedBody.extract[SubscribeRequest]
+      if (req.deviceId.trim.isEmpty || req.apnsToken.trim.isEmpty) {
+        BadRequest(Map("error" -> "deviceId and apnsToken are required"))
+      } else if (req.frequency < 1 || req.frequency > 4) {
+        BadRequest(Map("error" -> "frequency must be between 1 and 4"))
+      } else {
+        notificationService.subscribe(req) match {
+          case Right(_) => Map("ok" -> true)
+          case Left(e) =>
+            InternalServerError(Map("error" -> s"Failed to subscribe: ${e.getMessage}"))
+        }
+      }
+    } catch {
+      case e: MappingException =>
+        BadRequest(Map("error" -> s"Invalid request body: ${e.getMessage}"))
     }
   }
 
   // POST /notifications/dispatch — called by Airflow with no body. Counts
   // articles published since the last dispatch for this frequency tier and
-  // multicasts a generic "X new articles" message. Each call inserts an
-  // audit row in `notification_dispatches`. Optional query param
-  // `frequency` (1–4) filters subscribers AND scopes the "since last
-  // dispatch" lookup to that tier; omit to fan out to all.
-  // Auth via X-API-Key header.
+  // multicasts a generic "X new articles" message. Optional query param
+  // `frequency` (1–4) filters subscribers AND scopes the "since last dispatch"
+  // lookup to that tier; omit to fan out to all. Auth via X-API-Key header.
   post("/notifications/dispatch") {
-    if (!notificationsEnabled) {
-      ServiceUnavailable(Map("error" -> "notifications disabled"))
+    val provided = Option(request.getHeader("X-API-Key")).getOrElse("")
+    if (notificationsApiKey.isEmpty || provided != notificationsApiKey) {
+      Unauthorized(Map("error" -> "invalid or missing X-API-Key"))
     } else {
-      val provided = Option(request.getHeader("X-API-Key")).getOrElse("")
-      if (notificationsApiKey.isEmpty || provided != notificationsApiKey) {
-        Unauthorized(Map("error" -> "invalid or missing X-API-Key"))
+      val rawFrequency  = params.get("frequency")
+      val frequencyOpt  = rawFrequency.flatMap(_.toIntOption)
+      if (rawFrequency.isDefined && frequencyOpt.isEmpty) {
+        BadRequest(Map("error" -> "frequency must be a number"))
+      } else if (frequencyOpt.exists(f => f < 1 || f > 4)) {
+        BadRequest(Map("error" -> "frequency must be between 1 and 4"))
       } else {
-        val frequencyOpt = params.get("frequency").flatMap(_.toIntOption)
-        if (params.get("frequency").isDefined && frequencyOpt.isEmpty) {
-          BadRequest(Map("error" -> "frequency must be a number"))
-        } else if (frequencyOpt.exists(f => f < 1 || f > 4)) {
-          BadRequest(Map("error" -> "frequency must be between 1 and 4"))
-        } else {
-          val lastAsOf    = NotificationDispatchRepository.findLastAsOfArticleId(frequencyOpt)
-          val newArticles = ArticleRepository.countSinceId(lastAsOf)
-          val currentMax  = ArticleRepository.latestId()
-
-          val title = if (newArticles == 1) "1 new article" else s"$newArticles new articles"
-          val body  = "Check them out in Snel Nieuws"
-
-          val (sent, failed) =
-            if (newArticles == 0) (0, 0)
-            else {
-              val tokens = frequencyOpt match {
-                case Some(f) => NotificationSubscriptionRepository.findTokensByFrequency(f)
-                case None    => NotificationSubscriptionRepository.findAllTokens()
-              }
-              ApnsMessagingService.sendBatch(tokens, title, body)
-            }
-
-          NotificationDispatchRepository.recordDispatch(
-            frequency     = frequencyOpt,
-            asOfArticleId = currentMax,
-            newArticles   = newArticles,
-            sent          = sent,
-            failed        = failed,
-            title         = title,
-            body          = body
-          )
-
-          DispatchResponse(sent, failed, newArticles)
+        notificationService.dispatch(frequencyOpt) match {
+          case Right(DispatchOutcome.Sent(response)) => response
+          case Right(DispatchOutcome.Disabled) =>
+            ServiceUnavailable(Map("error" -> "notifications disabled"))
+          case Left(e) =>
+            InternalServerError(Map("error" -> s"Failed to dispatch: ${e.getMessage}"))
         }
       }
     }
-  }
-
-  // Health check
-  get("/health") {
-    Map("status" -> "ok", "service" -> "SnelNieuws API")
   }
 
   // Privacy policy — referenced from App Store listing and in-app menu

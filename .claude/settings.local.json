@@ -17,7 +17,12 @@
       "Bash(bash -n /Users/pranjutgogoi/workspace/emudoi/emudoi-snelnieuws-api/scripts/bootstrap-notification-secrets.sh)",
       "Bash(git fetch *)",
       "Bash(git merge *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(xargs ls -la)",
+      "Bash(sbt -no-colors -batch compile)",
+      "Bash(docker info *)",
+      "Bash(sbt -no-colors -batch test)",
+      "Bash(sbt -no-colors -batch \"clean; compile; test\")"
     ]
   }
 }
