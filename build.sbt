@@ -33,6 +33,10 @@ lazy val root = (project in file("."))
       // Pushy — JVM APNs (HTTP/2) client. Used to push notifications directly
       // to Apple, no Firebase indirection.
       "com.eatthepath"           % "pushy"                 % "0.15.4",
+      // Firebase Admin — only used to verify Firebase Auth ID tokens that
+      // the iOS app attaches to authenticated requests. Never used to send
+      // notifications (those still go through Pushy → APNs directly).
+      "com.google.firebase"      % "firebase-admin"        % "9.2.0",
       // Test
       "org.scalatra"            %% "scalatra-scalatest"              % ScalatraVersion % Test,
       "org.scalatest"           %% "scalatest"                       % "3.2.17"        % Test,

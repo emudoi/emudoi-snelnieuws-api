@@ -19,3 +19,14 @@ case class DispatchResponse(
   failed: Int,
   newArticles: Int
 )
+
+case class User(
+  id: String,
+  email: String,
+  createdAt: String,
+  updatedAt: String
+)
+
+case class UpsertUserRequest(email: String)
+
+case class LastPreferenceResponse(frequency: Int)

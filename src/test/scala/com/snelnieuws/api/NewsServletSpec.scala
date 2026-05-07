@@ -1,6 +1,7 @@
 package com.snelnieuws.api
 
 import com.snelnieuws.{Components, DatabaseTestSupport, StubApnsMessagingService}
+import com.snelnieuws.auth.FirebaseTokenVerifier
 import com.snelnieuws.db.Database
 import com.typesafe.config.ConfigFactory
 import org.json4s.{DefaultFormats, Formats}
@@ -32,10 +33,19 @@ class NewsServletSpec
 
   private val stubApns = new StubApnsMessagingService(acceptAll = true)
 
+  // Map of bearer token → Firebase uid that the stub verifier accepts.
+  // Tests use these to exercise authenticated routes; any other token is rejected.
+  private val testUidByToken = Map(
+    "alice-token" -> "uid-alice",
+    "bob-token"   -> "uid-bob"
+  )
+  private val stubVerifier = new FirebaseTokenVerifier.Stub(testUidByToken)
+
   private val components = new Components(
     provideTransactor = Database.transactor,
     rootConfig = testConfig,
-    apns = Some(stubApns)
+    apns = Some(stubApns),
+    verifierOverride = Some(stubVerifier)
   )
 
   addServlet(components.newsServlet, "/*")
@@ -269,6 +279,200 @@ class NewsServletSpec
       post("/notifications/subscribe", subBody, jsonHeader) {
         status shouldBe 400
       }
+    }
+
+    "leave user_id NULL when no Authorization header is sent" in {
+      requireDb()
+      val subBody = """{
+        "deviceId":  "subscribe-anonymous-device",
+        "apnsToken": "subscribe-anonymous-token",
+        "frequency": 2
+      }"""
+      post("/notifications/subscribe", subBody, jsonHeader) {
+        status shouldBe 200
+      }
+      val sub = components.notificationSubscriptionRepository
+      sub.findUserIdByDeviceId("subscribe-anonymous-device") shouldBe Right(Some(None))
+    }
+
+    "set user_id from a verified Bearer token" in {
+      requireDb()
+      // alice must already exist in users to satisfy the FK.
+      post(
+        "/users",
+        """{"email":"alice@example.com"}""",
+        jsonHeader ++ Map("Authorization" -> "Bearer alice-token")
+      ) { status shouldBe 200 }
+
+      val subBody = """{
+        "deviceId":  "subscribe-authed-device",
+        "apnsToken": "subscribe-authed-token",
+        "frequency": 1
+      }"""
+      post(
+        "/notifications/subscribe",
+        subBody,
+        jsonHeader ++ Map("Authorization" -> "Bearer alice-token")
+      ) {
+        status shouldBe 200
+      }
+      components.notificationSubscriptionRepository
+        .findUserIdByDeviceId("subscribe-authed-device") shouldBe Right(Some(Some("uid-alice")))
+    }
+
+    "clear user_id when subscribe is called without auth on a previously-linked row (logout)" in {
+      requireDb()
+      // Pre-condition from prior test: subscribe-authed-device is linked to uid-alice.
+      val subBody = """{
+        "deviceId":  "subscribe-authed-device",
+        "apnsToken": "subscribe-authed-token",
+        "frequency": 1
+      }"""
+      post("/notifications/subscribe", subBody, jsonHeader) { status shouldBe 200 }
+      components.notificationSubscriptionRepository
+        .findUserIdByDeviceId("subscribe-authed-device") shouldBe Right(Some(None))
+    }
+
+    "return 401 when Authorization header is present but invalid" in {
+      val subBody = """{
+        "deviceId":  "subscribe-bad-token-device",
+        "apnsToken": "subscribe-bad-token-token",
+        "frequency": 1
+      }"""
+      post(
+        "/notifications/subscribe",
+        subBody,
+        jsonHeader ++ Map("Authorization" -> "Bearer mallory-token")
+      ) {
+        status shouldBe 401
+      }
+    }
+  }
+
+  "POST /users" should {
+    val authAlice = jsonHeader ++ Map("Authorization" -> "Bearer alice-token")
+
+    "create a user record on first call" in {
+      requireDb()
+      post("/users", """{"email":"alice@example.com"}""", authAlice) {
+        status shouldBe 200
+        body should include("\"ok\":true")
+      }
+    }
+
+    "be idempotent (second call updates email)" in {
+      requireDb()
+      post("/users", """{"email":"alice@example.com"}""", authAlice) {
+        status shouldBe 200
+      }
+      post("/users", """{"email":"alice2@example.com"}""", authAlice) {
+        status shouldBe 200
+      }
+    }
+
+    "return 401 when Authorization header is missing" in {
+      post("/users", """{"email":"x@example.com"}""", jsonHeader) {
+        status shouldBe 401
+      }
+    }
+
+    "return 401 when token is unknown" in {
+      post(
+        "/users",
+        """{"email":"x@example.com"}""",
+        jsonHeader ++ Map("Authorization" -> "Bearer mallory-token")
+      ) {
+        status shouldBe 401
+      }
+    }
+
+    "return 400 when email is empty" in {
+      post("/users", """{"email":""}""", authAlice) {
+        status shouldBe 400
+      }
+    }
+
+  }
+
+  "GET /users/me/last-preference" should {
+    val authBob = jsonHeader ++ Map("Authorization" -> "Bearer bob-token")
+
+    "return 404 when the user has no subscription rows" in {
+      requireDb()
+      // Ensure bob exists but has no linked subscription.
+      post("/users", """{"email":"bob@example.com"}""", authBob) { status shouldBe 200 }
+      get("/users/me/last-preference", headers = authBob) {
+        status shouldBe 404
+      }
+    }
+
+    "return 401 when Authorization header is missing" in {
+      get("/users/me/last-preference") {
+        status shouldBe 401
+      }
+    }
+
+    "return the most-recently-updated frequency when one exists" in {
+      requireDb()
+      // Subscribe a device tied to bob (we set user_id directly here since
+      // task #2 hasn't yet wired auth into /notifications/subscribe).
+      post("/users", """{"email":"bob@example.com"}""", authBob) { status shouldBe 200 }
+      val sub = """{
+        "deviceId":  "users-spec-bob-device",
+        "apnsToken": "users-spec-bob-token",
+        "frequency": 2
+      }"""
+      post("/notifications/subscribe", sub, jsonHeader) { status shouldBe 200 }
+      import cats.effect.unsafe.implicits.global
+      import doobie.implicits._
+      sql"""UPDATE notification_subscriptions
+            SET user_id = 'uid-bob'
+            WHERE device_id = 'users-spec-bob-device'"""
+        .update.run.transact(Database.transactor).unsafeRunSync()
+
+      get("/users/me/last-preference", headers = authBob) {
+        status shouldBe 200
+        val parsed = org.json4s.jackson.parseJson(body)
+        (parsed \ "frequency").extract[Int] shouldBe 2
+      }
+    }
+  }
+
+  "DELETE /users/me" should {
+    val authAlice = jsonHeader ++ Map("Authorization" -> "Bearer alice-token")
+
+    "return 401 when Authorization header is missing" in {
+      delete("/users/me") {
+        status shouldBe 401
+      }
+    }
+
+    "remove the user (cascade-deleting their subscription rows) and return 204" in {
+      requireDb()
+      // Set up: alice exists + has a subscription tied to her uid.
+      post("/users", """{"email":"alice@example.com"}""", authAlice) { status shouldBe 200 }
+      val sub = """{
+        "deviceId":  "users-spec-alice-delete-device",
+        "apnsToken": "users-spec-alice-delete-token",
+        "frequency": 2
+      }"""
+      post("/notifications/subscribe", sub, jsonHeader) { status shouldBe 200 }
+      import cats.effect.unsafe.implicits.global
+      import doobie.implicits._
+      sql"""UPDATE notification_subscriptions
+            SET user_id = 'uid-alice'
+            WHERE device_id = 'users-spec-alice-delete-device'"""
+        .update.run.transact(Database.transactor).unsafeRunSync()
+
+      delete("/users/me", headers = authAlice) {
+        status shouldBe 204
+      }
+
+      // Subscription row was cascade-deleted.
+      val remaining = sql"""SELECT COUNT(*) FROM notification_subscriptions
+                            WHERE device_id = 'users-spec-alice-delete-device'"""
+        .query[Int].unique.transact(Database.transactor).unsafeRunSync()
+      remaining shouldBe 0
     }
   }
 

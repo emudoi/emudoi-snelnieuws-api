@@ -44,6 +44,18 @@ spec:
           {{- with secret "secret/data/snelnieuws/api/apns" -}}
           {{ .Data.data.key_p8 }}
           {{- end }}
+        # Firebase service-account JSON, rendered to
+        # /vault/secrets/firebase-service-account.json (path expected via
+        # FIREBASE_SERVICE_ACCOUNT_PATH in secret/snelnieuws/api → app.env).
+        # firebase-admin reads this file to verify Firebase ID tokens
+        # presented by the iOS app on /users + /notifications/subscribe.
+        # Stored at secret/snelnieuws/api/firebase under key `service_account_json`.
+        # Provisioned by scripts/bootstrap-firebase-secrets.sh.
+        vault.hashicorp.com/agent-inject-secret-firebase-service-account.json: "secret/data/snelnieuws/api/firebase"
+        vault.hashicorp.com/agent-inject-template-firebase-service-account.json: |
+          {{- with secret "secret/data/snelnieuws/api/firebase" -}}
+          {{ .Data.data.service_account_json }}
+          {{- end }}
     spec:
       serviceAccountName: emudoi-snelnieuws-api
       imagePullSecrets:

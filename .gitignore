@@ -25,3 +25,7 @@ emudoi_infra_only
 # Vault seeding inputs (real secret values — never commit)
 secrets.yaml
 secrets.*.yaml
+# Firebase Admin service-account JSON downloaded from Firebase Console.
+# Used as input to scripts/bootstrap-firebase-secrets.sh. Equivalent to a
+# password for the Firebase project — never commit.
+*-firebase-adminsdk-*.json

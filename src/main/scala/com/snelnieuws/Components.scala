@@ -2,12 +2,14 @@ package com.snelnieuws
 
 import cats.effect.IO
 import com.snelnieuws.api.{HealthServlet, NewsServlet}
+import com.snelnieuws.auth.FirebaseTokenVerifier
 import com.snelnieuws.db.Database
 import com.snelnieuws.kafka.SummarizedImportKafkaConfig
 import com.snelnieuws.repository.{
   ArticleRepository,
   NotificationDispatchRepository,
-  NotificationSubscriptionRepository
+  NotificationSubscriptionRepository,
+  UserRepository
 }
 import com.snelnieuws.service.{
   ApnsConfig,
@@ -16,7 +18,8 @@ import com.snelnieuws.service.{
   ArticleService,
   NotificationService,
   PushyApnsMessagingService,
-  SummarizedArticleConsumer
+  SummarizedArticleConsumer,
+  UserService
 }
 import com.typesafe.config.{Config, ConfigFactory}
 import doobie.hikari.HikariTransactor
@@ -27,7 +30,8 @@ import java.nio.file.{Files, Paths}
 class Components(
   provideTransactor: => HikariTransactor[IO],
   rootConfig: Config,
-  apns: Option[ApnsMessagingService]
+  apns: Option[ApnsMessagingService],
+  verifierOverride: Option[FirebaseTokenVerifier] = None
 ) {
 
   private val logger = LoggerFactory.getLogger(classOf[Components])
@@ -39,10 +43,45 @@ class Components(
     new NotificationSubscriptionRepository(provideTransactor)
   lazy val notificationDispatchRepository: NotificationDispatchRepository =
     new NotificationDispatchRepository(provideTransactor)
+  lazy val userRepository: UserRepository =
+    new UserRepository(provideTransactor)
 
   // Notification config (api-key needed by servlet for transport-level auth)
   private val notificationsConfig         = rootConfig.getConfig("notifications")
   val notificationsApiKey: String         = notificationsConfig.getString("api-key")
+
+  // Firebase ID token verifier. Tests pass a Stub via verifierOverride.
+  // Production reads firebase.project-id from config; if empty we fall
+  // back to RejectAll so the auth-required endpoints stay locked rather
+  // than letting unverified requests through.
+  lazy val firebaseVerifier: FirebaseTokenVerifier = {
+    verifierOverride.getOrElse {
+      val firebaseCfg = rootConfig.getConfig("firebase")
+      val projectId   = firebaseCfg.getString("project-id")
+      if (projectId.isEmpty) {
+        logger.warn(
+          "firebase.project-id is empty — auth-required endpoints will reject all requests. " +
+            "Set FIREBASE_PROJECT_ID to enable Firebase ID token verification."
+        )
+        FirebaseTokenVerifier.RejectAll
+      } else {
+        try {
+          new FirebaseTokenVerifier.FirebaseAdmin(
+            projectId          = projectId,
+            serviceAccountPath = firebaseCfg.getString("service-account-path")
+          )
+        } catch {
+          case e: Exception =>
+            logger.error(
+              s"Failed to initialize Firebase Admin SDK: ${e.getMessage}. " +
+                "Falling back to RejectAll.",
+              e
+            )
+            FirebaseTokenVerifier.RejectAll
+        }
+      }
+    }
+  }
 
   // Services
   lazy val articleService: ArticleService =
@@ -55,6 +94,9 @@ class Components(
       notificationDispatchRepository,
       apns
     )
+
+  lazy val userService: UserService =
+    new UserService(userRepository, notificationSubscriptionRepository)
 
   // Schedulers / consumers
   private val cleanupCfg = rootConfig.getConfig("articles.cleanup")
@@ -90,7 +132,13 @@ class Components(
 
   // Servlets
   lazy val newsServlet: NewsServlet =
-    new NewsServlet(articleService, notificationService, notificationsApiKey)
+    new NewsServlet(
+      articleService,
+      notificationService,
+      userService,
+      firebaseVerifier,
+      notificationsApiKey
+    )
   lazy val healthServlet: HealthServlet =
     new HealthServlet
 

@@ -27,8 +27,11 @@ class NotificationService(
 
   private val logger = LoggerFactory.getLogger(classOf[NotificationService])
 
-  def subscribe(req: SubscribeRequest): Either[Throwable, Int] =
-    subscriptionRepository.upsert(req.deviceId, req.apnsToken, req.frequency)
+  def subscribe(
+    req: SubscribeRequest,
+    userId: Option[String] = None
+  ): Either[Throwable, Int] =
+    subscriptionRepository.upsert(req.deviceId, req.apnsToken, req.frequency, userId)
 
   def dispatch(frequency: Option[Int]): Either[Throwable, DispatchOutcome] = {
     apns match {
