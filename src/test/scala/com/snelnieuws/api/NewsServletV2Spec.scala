@@ -196,6 +196,28 @@ class NewsServletV2Spec
     }
   }
 
+  "GET /v2/categories" should {
+    "return the hardcoded canonical list under the full gate" in {
+      requireDb()
+      get("/v2/categories", Map.empty[String, String], gatedHeaders) {
+        status shouldBe 200
+        val list = (org.json4s.jackson.parseJson(body) \ "categories").extract[List[String]]
+        list shouldBe List(
+          "politics", "economy", "business", "finance", "technology", "science",
+          "health", "sports", "culture", "environment", "world",
+          "local", "other"
+        )
+      }
+    }
+
+    "return 401 without X-Client-Key (gate still applies)" in {
+      requireDb()
+      get("/v2/categories", Map.empty[String, String], Map("X-Client" -> "ios/1.4.0")) {
+        status shouldBe 401
+      }
+    }
+  }
+
   "GET /v2/app/config" should {
     "succeed under the full gate" in {
       get("/v2/app/config", Map.empty[String, String], gatedHeaders) {

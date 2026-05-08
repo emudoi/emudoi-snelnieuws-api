@@ -3,6 +3,7 @@ package com.snelnieuws.api
 import com.snelnieuws.auth.FirebaseTokenVerifier
 import com.snelnieuws.model.{
   ArticleCreate,
+  Categories,
   LastPreferenceResponse,
   NewsFetchResponse,
   RegisterClientRequest,
@@ -167,12 +168,11 @@ class NewsServletV2(
     }
   }
 
+  // Hardcoded list — the canonical taxonomy the snelmind summarizer
+  // constrains the LLM to (see `Categories.all` for source-of-truth note).
+  // Independent of what's in the DB so the iOS UI shows a stable list.
   get("/categories") {
-    articleService.findCategories() match {
-      case Right(categories) => Map("categories" -> categories)
-      case Left(e) =>
-        InternalServerError(Map("error" -> s"Failed to load categories: ${e.getMessage}"))
-    }
+    Map("categories" -> Categories.all)
   }
 
   get("/app/config") {
