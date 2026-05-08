@@ -53,6 +53,30 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         Left(e)
     }
 
+  /** Articles whose category matches any of the supplied list. Comparison
+    * is case-insensitive; callers should pre-lowercase their list to match
+    * the binding type cleanly. Empty list yields no rows (caller's
+    * responsibility to short-circuit before calling).
+    */
+  def findByCategories(categories: List[String], limit: Int = 100): Either[Throwable, List[ArticleRow]] =
+    try {
+      val lowercased = categories.map(_.toLowerCase)
+      Right(
+        sql"""
+          SELECT id, author, title, description, url, url_to_image,
+                 to_char(published_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), content, category
+          FROM articles
+          WHERE LOWER(category) = ANY($lowercased)
+          ORDER BY published_at DESC
+          LIMIT $limit
+        """.query[ArticleRow].to[List].transact(transactor).unsafeRunSync()
+      )
+    } catch {
+      case e: Exception =>
+        logger.error(s"Failed to load articles by categories=${categories.mkString(",")}: ${e.getMessage}", e)
+        Left(e)
+    }
+
   def search(query: String, limit: Int = 100): Either[Throwable, List[ArticleRow]] =
     try {
       val searchPattern = s"%${query.toLowerCase}%"

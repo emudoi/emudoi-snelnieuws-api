@@ -114,6 +114,42 @@ class NewsServletV2(
     }
   }
 
+  /** Personalised feed — returns articles whose category is in the
+    * caller-supplied list. Used by iOS on the Trending tab when the user
+    * has a non-empty category selection.
+    *
+    * `categories` is a comma-separated list of canonical names (the same
+    * set served by GET /categories). Unknown names are silently dropped;
+    * if the post-filter list is empty the request is rejected with 400.
+    * An empty articles[] is a valid 200 response — iOS surfaces an
+    * empty-state card with a "Show all news" button to fall back to
+    * /everything.
+    */
+  get("/feed") {
+    val raw = params.getOrElse("categories", "")
+    val canonical = Categories.all.toSet
+    val parsed = raw
+      .split(',')
+      .toList
+      .map(_.trim.toLowerCase)
+      .filter(_.nonEmpty)
+      .filter(canonical.contains)
+      .distinct
+    if (parsed.isEmpty) {
+      BadRequest(Map(
+        "error" -> "categories required and must contain at least one canonical category"
+      ))
+    } else {
+      val limit = params.getOrElse("pageSize", "100").toInt
+      articleService.findByCategories(parsed, limit) match {
+        case Right(articles) =>
+          NewsFetchResponse(status = "ok", totalResults = articles.length, articles = articles)
+        case Left(e) =>
+          InternalServerError(Map("error" -> s"Failed to load articles: ${e.getMessage}"))
+      }
+    }
+  }
+
   get("/top-headlines") {
     val category = params.getOrElse("category", "")
     val limit    = params.getOrElse("pageSize", "100").toInt

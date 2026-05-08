@@ -37,6 +37,9 @@ class ArticleService(
   def findByCategory(category: String, limit: Int = 100): Either[Throwable, List[Article]] =
     repository.findByCategory(category, limit).map(_.map(toArticle)).map(interleaveBySource)
 
+  def findByCategories(categories: List[String], limit: Int = 100): Either[Throwable, List[Article]] =
+    repository.findByCategories(categories, limit).map(_.map(toArticle)).map(interleaveBySource)
+
   def search(query: String, limit: Int = 100): Either[Throwable, List[Article]] =
     repository.search(query, limit).map(_.map(toArticle)).map(interleaveBySource)
 

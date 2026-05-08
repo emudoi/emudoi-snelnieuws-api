@@ -3,6 +3,7 @@ package com.snelnieuws.api
 import com.snelnieuws.{Components, DatabaseTestSupport, StubApnsMessagingService}
 import com.snelnieuws.auth.FirebaseTokenVerifier
 import com.snelnieuws.db.Database
+import com.snelnieuws.model.ArticleCreate
 import com.typesafe.config.ConfigFactory
 import org.json4s.{DefaultFormats, Formats}
 import org.scalatra.test.scalatest.ScalatraSuite
@@ -192,6 +193,66 @@ class NewsServletV2Spec
       get("/v2/everything", Map.empty[String, String], gatedHeaders) {
         status shouldBe 200
         body should include("\"status\":\"ok\"")
+      }
+    }
+  }
+
+  "GET /v2/feed" should {
+    // Distinct titles per insert so we can identify our own rows in the
+    // response body without depending on what else is in the DB. Categories
+    // chosen from Categories.all to satisfy the canonical-name validation.
+    "filter articles to the supplied categories" in {
+      requireDb()
+      val politicsTitle = s"feed-spec-politics-${UUID.randomUUID()}"
+      val sportsTitle   = s"feed-spec-sports-${UUID.randomUUID()}"
+      components.articleService.create(ArticleCreate(
+        author = Some("feed-spec"), title = politicsTitle, description = None,
+        url = s"https://example.com/feed-spec/${UUID.randomUUID()}",
+        urlToImage = None, content = None, category = Some("politics")
+      )) shouldBe a[Right[_, _]]
+      components.articleService.create(ArticleCreate(
+        author = Some("feed-spec"), title = sportsTitle, description = None,
+        url = s"https://example.com/feed-spec/${UUID.randomUUID()}",
+        urlToImage = None, content = None, category = Some("sports")
+      )) shouldBe a[Right[_, _]]
+
+      get("/v2/feed", Map("categories" -> "politics"), gatedHeaders) {
+        status shouldBe 200
+        body should include("\"status\":\"ok\"")
+        body should include(politicsTitle)
+        body should not include sportsTitle
+      }
+    }
+
+    "silently drop unknown category names but use the valid ones" in {
+      requireDb()
+      get("/v2/feed", Map("categories" -> "politics,not-a-real-category"), gatedHeaders) {
+        status shouldBe 200
+        body should include("\"status\":\"ok\"")
+      }
+    }
+
+    "return 400 when all supplied categories are unknown" in {
+      requireDb()
+      get("/v2/feed", Map("categories" -> "not-real,also-not-real"), gatedHeaders) {
+        status shouldBe 400
+      }
+    }
+
+    "return 400 when the categories param is missing or empty" in {
+      requireDb()
+      get("/v2/feed", Map.empty[String, String], gatedHeaders) {
+        status shouldBe 400
+      }
+      get("/v2/feed", Map("categories" -> ""), gatedHeaders) {
+        status shouldBe 400
+      }
+    }
+
+    "return 401 without X-Client-Key (gate still applies)" in {
+      requireDb()
+      get("/v2/feed", Map("categories" -> "politics"), Map("X-Client" -> "ios/1.4.0")) {
+        status shouldBe 401
       }
     }
   }
