@@ -1,0 +1,129 @@
+# Black-box probe + alerts for snelnieuws-api.
+#
+# The app exposes /health (used by liveness/readiness probes too). We probe
+# the public URL from inside the cluster via blackbox-exporter and alert
+# on probe_success=0 (anything in DNS → ingress → TLS → app → DB chain
+# failing) plus standard pod/container alerts scoped to this namespace.
+# See cluster README "Monitoring" section for the full pattern.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: snelnieuws-api
+  namespace: emudoi-snelnieuws-api
+spec:
+  jobName: snelnieuws-api-public
+  prober:
+    url: blackbox-prometheus-blackbox-exporter.monitoring.svc:9115
+  module: http_2xx
+  interval: 30s
+  scrapeTimeout: 10s
+  targets:
+    staticConfig:
+      static:
+        - https://api.snel.emudoi.com/health
+      labels:
+        service: snelnieuws-api
+        tier: public
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: snelnieuws-api
+  namespace: emudoi-snelnieuws-api
+spec:
+  groups:
+    - name: snelnieuws-api.public
+      interval: 30s
+      rules:
+        - alert: SnelnieuwsApiPublicDown
+          expr: probe_success{service="snelnieuws-api"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            namespace: emudoi-snelnieuws-api
+          annotations:
+            summary: "api.snel.emudoi.com /health probe failing for 2m"
+            description: "blackbox http_2xx probe to https://api.snel.emudoi.com/health has been failing. Check ingress + pod logs in the emudoi-snelnieuws-api namespace."
+
+        - alert: SnelnieuwsApiPublicSlow
+          expr: probe_duration_seconds{service="snelnieuws-api"} > 2
+          for: 10m
+          labels:
+            severity: warning
+            namespace: emudoi-snelnieuws-api
+          annotations:
+            summary: "api.snel.emudoi.com /health taking >2s for 10m"
+            description: "Probe duration {{ $value | printf \"%.2f\" }}s — degraded but not yet down. Check JVM heap / DB pool."
+
+        - alert: SnelnieuwsApiCertExpiringSoon
+          expr: probe_ssl_earliest_cert_expiry{service="snelnieuws-api"} - time() < 7 * 86400
+          for: 5m
+          labels:
+            severity: critical
+            namespace: emudoi-snelnieuws-api
+          annotations:
+            summary: "api.snel.emudoi.com TLS cert expires in <7 days"
+            description: "Cert-manager wildcard renewal hasn't kicked in. Check the Certificate resource in cert-manager namespace."
+
+    - name: snelnieuws-api.workload
+      interval: 60s
+      rules:
+        - alert: SnelnieuwsApiPodCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total{
+              namespace="emudoi-snelnieuws-api"
+            }[10m]) > 2
+          for: 5m
+          labels:
+            severity: critical
+            namespace: emudoi-snelnieuws-api
+          annotations:
+            summary: "snelnieuws-api pod restarted >2 times in 10m"
+            description: "Pod {{ $labels.pod }} container {{ $labels.container }} restarted {{ $value }} times in 10m."
+
+        - alert: SnelnieuwsApiOOMKilled
+          expr: |
+            increase(kube_pod_container_status_last_terminated_reason{
+              namespace="emudoi-snelnieuws-api",
+              reason="OOMKilled"
+            }[1h]) > 0
+          for: 1m
+          labels:
+            severity: critical
+            namespace: emudoi-snelnieuws-api
+          annotations:
+            summary: "snelnieuws-api OOMKilled in the last hour"
+            description: "Container {{ $labels.container }} was OOMKilled. Check JVM -Xmx vs container memory limit."
+
+        - alert: SnelnieuwsApiNoReplicas
+          expr: |
+            kube_deployment_status_replicas_available{
+              namespace="emudoi-snelnieuws-api",
+              deployment="snelnieuws-api"
+            } == 0
+          for: 2m
+          labels:
+            severity: critical
+            namespace: emudoi-snelnieuws-api
+          annotations:
+            summary: "snelnieuws-api has zero available replicas"
+            description: "Deployment is below replica target. Check pod state + node capacity."
+
+        - alert: SnelnieuwsApiMemoryNearLimit
+          expr: |
+            container_memory_working_set_bytes{
+              namespace="emudoi-snelnieuws-api",
+              container="app"
+            } / on(pod, container) kube_pod_container_resource_limits{
+              namespace="emudoi-snelnieuws-api",
+              container="app",
+              resource="memory"
+            } > 0.9
+          for: 15m
+          labels:
+            severity: warning
+            namespace: emudoi-snelnieuws-api
+          annotations:
+            summary: "snelnieuws-api memory >90% of limit for 15m"
+            description: "Container {{ $labels.container }} working set is {{ $value | humanizePercentage }} of memory limit."
