@@ -71,7 +71,12 @@
       "Bash(sbt -batch compile)",
       "Bash(sbt -batch \"clean; compile\")",
       "Bash(sbt -batch \"Test/compile\")",
-      "Bash(sbt -batch test)"
+      "Bash(sbt -batch test)",
+      "Bash(sbt -batch \"compile; Test/compile\")",
+      "Bash(python3 -c \"import json,sys; [print\\(e.get\\('name',''\\),'=', e.get\\('value','\\(secretRef\\)'\\)\\) for e in json.loads\\(sys.stdin.read\\(\\)\\)]\")",
+      "Bash(codesign -d --entitlements - /Users/pranjutgogoi/Library/Developer/Xcode/DerivedData/SnelNieuws-dxyhlkfircjzkiavkzxtmvrjrsly/Build/Products/Debug-iphoneos/SnelNieuws.app)",
+      "Bash(security cms *)",
+      "Bash(bash -n scripts/bootstrap-notification-secrets.sh)"
     ]
   }
 }
