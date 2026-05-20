@@ -58,6 +58,7 @@ class ScalatraBootstrap extends LifeCycle {
     // anyway, so /v2/android/* always wins over /v2/*. Independent
     // before-filter that requires `X-Client: android/<v>`.
     context.mount(components.androidNotificationsServletV2, "/v2/android/*")
+    context.mount(components.newsServletV3, "/v3/*")
     context.mount(components.newsServletV2, "/v2/*")
     // v1 catch-all stays mounted last, conceptually — kept here for
     // readability of the routing table.

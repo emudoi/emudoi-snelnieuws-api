@@ -9,6 +9,7 @@ import com.snelnieuws.api.{
   ImageServlet,
   NewsServlet,
   NewsServletV2,
+  NewsServletV3,
   NotificationBroadcastServlet,
   NotificationDispatchServlet,
   StaticContentServlet
@@ -248,6 +249,15 @@ class Components(
     )
   lazy val newsServletV2: NewsServletV2 =
     new NewsServletV2(
+      articleService,
+      notificationService,
+      userService,
+      appClientRepository,
+      firebaseVerifier
+    )
+  lazy val newsServletV3: NewsServletV3 =
+    new NewsServletV3(
+      articleRepository,
       articleService,
       notificationService,
       userService,

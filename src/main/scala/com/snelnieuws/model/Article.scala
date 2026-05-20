@@ -1,6 +1,6 @@
 package com.snelnieuws.model
 
-import java.time.Instant
+import java.time.OffsetDateTime
 
 case class ArticleRow(
   id: Long,
@@ -40,4 +40,22 @@ case class ArticleCreate(
   urlToImage: Option[String],
   content: Option[String],
   category: Option[String]
+)
+
+/** Repo projection for v3 reads. `publishedAt` is raw (Instant) so the
+  * servlet can both format it for the JSON payload and use it directly for
+  * the next-page cursor without re-parsing.
+  */
+case class ArticleV3Row(
+  id: Long,
+  author: Option[String],
+  title: String,
+  description: Option[String],
+  url: String,
+  urlToImage: Option[String],
+  publishedAt: OffsetDateTime,
+  content: Option[String],
+  category: Option[String],
+  country: Option[String],
+  isLocal: Boolean
 )

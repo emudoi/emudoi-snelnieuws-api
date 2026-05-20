@@ -2,14 +2,14 @@ package com.snelnieuws.repository
 
 import cats.effect.IO
 import cats.effect.unsafe.implicits.global
-import com.snelnieuws.model.{ArticleCreate, ArticleRow, SummarizedArticleExport}
+import com.snelnieuws.model.{ArticleCreate, ArticleRow, ArticleV3Row, SummarizedArticleExport}
 import doobie._
 import doobie.implicits._
 import doobie.hikari.HikariTransactor
 import doobie.postgres.implicits._
 import org.slf4j.LoggerFactory
 
-import java.time.OffsetDateTime
+import java.time.{Instant, OffsetDateTime, ZoneOffset}
 
 class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
 
@@ -275,6 +275,79 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
     catch {
       case e: Exception =>
         logger.error(s"Failed to load categories: ${e.getMessage}", e)
+        Left(e)
+    }
+
+  // ─────────────────────────────── v3 reads ───────────────────────────────
+  //
+  // Country-scoped feed with cursor pagination. Caller passes the request
+  // country (already validated to be 2 lowercase letters). Rows match if
+  // `articles.country` equals it OR the request country appears in
+  // `articles.shared_countries`. Category filter is optional — when present,
+  // an article matches if its `category` is in the list OR its
+  // `shared_categories` array overlaps the list. Returns (page, hasMore)
+  // where `hasMore` is computed by fetching one extra row and checking.
+
+  def findV3(
+    country: String,
+    categories: List[String],
+    cursor: Option[(Instant, Long)],
+    limit: Int
+  ): Either[Throwable, (List[ArticleV3Row], Boolean)] =
+    try {
+      val lowerCats = categories.map(_.toLowerCase)
+      val baseSelect = fr"""
+        SELECT id, author, title, description, url, url_to_image,
+               published_at, content, category, country,
+               (country = $country OR $country = ANY(shared_countries)) AS is_local
+        FROM articles
+        WHERE (country = $country OR $country = ANY(shared_countries))
+      """
+
+      val categoryFilter: Fragment =
+        if (lowerCats.isEmpty) Fragment.empty
+        // `shared_categories` is text[]; the JDBC driver binds Scala
+        // List[String] as varchar[], so an explicit ::text[] cast is needed
+        // for the && (array overlap) operator to type-check.
+        else fr"AND (LOWER(category) = ANY($lowerCats) OR shared_categories && $lowerCats::text[])"
+
+      val cursorFilter: Fragment = cursor match {
+        case Some((pubAt, id)) =>
+          val pubOdt = OffsetDateTime.ofInstant(pubAt, ZoneOffset.UTC)
+          fr"AND (published_at, id) < ($pubOdt, $id)"
+        case None => Fragment.empty
+      }
+
+      val orderLimit = fr"ORDER BY published_at DESC, id DESC LIMIT ${limit + 1}"
+
+      val q = baseSelect ++ categoryFilter ++ cursorFilter ++ orderLimit
+      val rows = q.query[ArticleV3Row].to[List].transact(transactor).unsafeRunSync()
+      val hasMore = rows.size > limit
+      Right((rows.take(limit), hasMore))
+    } catch {
+      case e: Exception =>
+        logger.error(
+          s"Failed to load v3 feed country=$country categories=${categories.mkString(",")} cursor=$cursor: ${e.getMessage}",
+          e
+        )
+        Left(e)
+    }
+
+  /** Single-article fetch with the same v3 projection (including `is_local`). */
+  def findV3ById(country: String, id: Long): Either[Throwable, Option[ArticleV3Row]] =
+    try
+      Right(
+        sql"""
+          SELECT id, author, title, description, url, url_to_image,
+                 published_at, content, category, country,
+                 (country = $country OR $country = ANY(shared_countries)) AS is_local
+          FROM articles
+          WHERE id = $id
+        """.query[ArticleV3Row].option.transact(transactor).unsafeRunSync()
+      )
+    catch {
+      case e: Exception =>
+        logger.error(s"Failed to load v3 article id=$id country=$country: ${e.getMessage}", e)
         Left(e)
     }
 
