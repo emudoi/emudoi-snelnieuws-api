@@ -5,8 +5,9 @@ Four DAGs in this file:
   - snelnieuws_notifications_prod              → fan-out to iOS (production
         APNs) + Android (FCM) in parallel. One trigger, both platforms.
         Triggered automatically by snelnieuws_notifications_auto_watcher
-        whenever snelmind_summarize_today succeeds, and also available as
-        a manual trigger from the Airflow UI.
+        when its article-delta / quiet-hour / cooldown / daily-cap gates
+        all pass, and also available as a manual trigger from the
+        Airflow UI.
         iOS path: POST /notifications/dispatch — App Store + TestFlight
         builds whose tokens work against api.push.apple.com.
         Android path: POST /android/notifications/dispatch — every Android
@@ -27,10 +28,13 @@ Four DAGs in this file:
         Flip rows in psql to enable/disable per side without redeploying.
 
   - snelnieuws_notifications_auto_watcher      → scheduled every 5 minutes.
-        Polls the Airflow metastore for new successful runs of
-        snelmind_summarize_today and triggers snelnieuws_notifications_prod
-        when it sees one. Caps at 4 auto-triggers per day, keyed by the
-        summarize run's logical date in Europe/Amsterdam. Manual runs of
+        Triggers snelnieuws_notifications_prod when ≥ 5 new summarized
+        articles have appeared since the last fire, inside the
+        07:00–19:00 Amsterdam active window, with ≥ 2 h between fires
+        and ≤ 4 fires per Amsterdam day. Decoupled from
+        snelmind_summarize_today — runs purely off the article-id delta
+        polled from the ingestion API's
+        /api/articles/summarized/last-id. Manual runs of
         snelnieuws_notifications_prod do not count against the cap.
 
 Idempotency: each dispatch endpoint records every call in its own table
@@ -46,38 +50,44 @@ environments. The shared X-API-Key is read from an Airflow Variable
 
 Watcher state is kept in Airflow Variables:
 
-  - `snelnieuws_last_seen_summarize_run_id`     → run_id of the most
-        recent snelmind_summarize_today success we've processed. Seeded
-        on first run so rollout doesn't trigger a backfire.
+  - `snelnieuws_last_notified_article_id`       → pivot: the summarized
+        article id at the time of the most recent auto-fire. Seeded to
+        the current ingestion-api `last-id` on the first watcher tick
+        after deploy so rollout doesn't fire on the historical backlog.
+  - `snelnieuws_last_fired_at_utc`              → ISO-8601 UTC timestamp
+        of the most recent auto-fire. Enforces the ≥ 2 h cooldown.
   - `snelnieuws_auto_trigger_count_YYYY_MM_DD`  → per-day auto-trigger
-        counter, capped at 4. Keyed by Amsterdam logical date of the
-        upstream summarize run, not by watcher tick time, so a summarize
-        finishing at 23:58 counts against that day even if the watcher
-        observes it at 00:02.
+        counter, capped at 4. Keyed by the Amsterdam date of the fire
+        time itself (not by any upstream summarize run).
 """
 import pendulum
 import requests
 from airflow.decorators import dag, task
-from airflow.models import DagRun, Variable
+from airflow.models import Variable
 from airflow.models.param import Param
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-from airflow.utils.state import State
 
 PROD_ENDPOINT_IOS         = "https://api.snel.emudoi.com/notifications/dispatch"
 SANDBOX_ENDPOINT_IOS      = "https://api.snel.emudoi.com/notifications/dispatch-sandbox"
 BROADCAST_ENDPOINT_IOS    = "https://api.snel.emudoi.com/notifications/broadcast"
 DISPATCH_ENDPOINT_ANDROID = "https://api.snel.emudoi.com/android/notifications/dispatch"
 BROADCAST_ENDPOINT_ANDROID = "https://api.snel.emudoi.com/android/notifications/broadcast"
+INGESTION_LAST_ID_ENDPOINT = "https://ingestion.emudoi.com/api/articles/summarized/last-id"
 
 DISPATCH_TIMEOUT_S = 60
+LAST_ID_TIMEOUT_S = 15
 
-UPSTREAM_DAG_ID         = "snelmind_summarize_today"
-PROD_DAG_ID             = "snelnieuws_notifications_prod"
+PROD_DAG_ID               = "snelnieuws_notifications_prod"
 MAX_AUTO_TRIGGERS_PER_DAY = 4
+NEW_ARTICLES_THRESHOLD    = 5
+ACTIVE_WINDOW_START_HOUR  = 7
+ACTIVE_WINDOW_END_HOUR    = 19
+MIN_COOLDOWN_HOURS        = 2
 AMSTERDAM = pendulum.timezone("Europe/Amsterdam")
 
-VAR_LAST_SEEN_RUN_ID   = "snelnieuws_last_seen_summarize_run_id"
-VAR_COUNTER_PREFIX     = "snelnieuws_auto_trigger_count_"  # + YYYY_MM_DD
+VAR_LAST_NOTIFIED_ARTICLE_ID = "snelnieuws_last_notified_article_id"
+VAR_LAST_FIRED_AT_UTC        = "snelnieuws_last_fired_at_utc"
+VAR_COUNTER_PREFIX           = "snelnieuws_auto_trigger_count_"  # + YYYY_MM_DD
 
 
 def _post_dispatch(endpoint: str) -> dict:
@@ -112,7 +122,8 @@ def _post_broadcast(endpoint: str, text: str) -> dict:
         "Dispatch SnelNieuws push notifications. Fans out to iOS "
         "(production APNs) and Android (FCM) in parallel — one trigger, "
         "both platforms. Auto-triggered by snelnieuws_notifications_auto_watcher "
-        "after snelmind_summarize_today succeeds; also available for manual runs."
+        "on the article-id delta, inside the Amsterdam active window; "
+        "also available for manual runs."
     ),
     schedule=None,
     start_date=pendulum.datetime(2026, 5, 1, tz="Europe/Amsterdam"),
@@ -195,9 +206,11 @@ def snelnieuws_notifications_broadcast_manual():
 @dag(
     dag_id="snelnieuws_notifications_auto_watcher",
     description=(
-        "Polls the Airflow metastore for new successful runs of "
-        "snelmind_summarize_today and triggers snelnieuws_notifications_prod "
-        "when it sees one. Caps at 4 auto-triggers per day."
+        "Triggers snelnieuws_notifications_prod when ≥ 5 new summarized "
+        "articles have appeared since the last fire, inside 07:00–19:00 "
+        "Amsterdam, with ≥ 2 h between fires and ≤ 4 fires per day. "
+        "Decoupled from snelmind_summarize_today — polls the ingestion "
+        "API's article-id."
     ),
     schedule="*/5 * * * *",
     start_date=pendulum.datetime(2026, 5, 15, tz="Europe/Amsterdam"),
@@ -206,66 +219,79 @@ def snelnieuws_notifications_broadcast_manual():
     tags=["snelnieuws", "notifications", "auto"],
 )
 def snelnieuws_notifications_auto_watcher():
-    @task
-    def detect_new_summarize_run() -> dict | None:
-        last_seen = Variable.get(VAR_LAST_SEEN_RUN_ID, default_var="")
-
-        runs = DagRun.find(dag_id=UPSTREAM_DAG_ID, state=State.SUCCESS)
-        if not runs:
-            return None
-        latest = max(runs, key=lambda r: r.end_date or r.execution_date)
-
-        if not last_seen:
-            # First-deploy guard: seed the marker silently so rollout
-            # doesn't fire on the most recent past success.
-            Variable.set(VAR_LAST_SEEN_RUN_ID, latest.run_id)
-            return None
-
-        if latest.run_id == last_seen:
-            return None
-
-        logical_date_local = latest.execution_date.astimezone(AMSTERDAM)
-        return {
-            "run_id": latest.run_id,
-            "counter_key": logical_date_local.strftime("%Y_%m_%d"),
-        }
+    @task.short_circuit
+    def check_quiet_hours() -> bool:
+        hour = pendulum.now(AMSTERDAM).hour
+        return ACTIVE_WINDOW_START_HOUR <= hour < ACTIVE_WINDOW_END_HOUR
 
     @task.short_circuit
-    def gate_by_daily_cap(summarize_run: dict | None) -> bool:
-        if summarize_run is None:
-            return False
-        var_name = VAR_COUNTER_PREFIX + summarize_run["counter_key"]
-        count = int(Variable.get(var_name, default_var="0"))
+    def check_daily_cap() -> bool:
+        today_key = pendulum.now(AMSTERDAM).strftime("%Y_%m_%d")
+        count = int(Variable.get(VAR_COUNTER_PREFIX + today_key, default_var="0"))
         return count < MAX_AUTO_TRIGGERS_PER_DAY
 
-    @task
-    def advance_marker(summarize_run: dict) -> None:
-        var_name = VAR_COUNTER_PREFIX + summarize_run["counter_key"]
-        count = int(Variable.get(var_name, default_var="0"))
-        Variable.set(var_name, str(count + 1))
-        Variable.set(VAR_LAST_SEEN_RUN_ID, summarize_run["run_id"])
+    @task.short_circuit
+    def check_cooldown() -> bool:
+        last_fired_str = Variable.get(VAR_LAST_FIRED_AT_UTC, default_var="")
+        if not last_fired_str:
+            return True
+        last_fired = pendulum.parse(last_fired_str)
+        return (pendulum.now("UTC") - last_fired).total_seconds() >= MIN_COOLDOWN_HOURS * 3600
 
-    summarize = detect_new_summarize_run()
-    gated = gate_by_daily_cap(summarize)
+    @task.short_circuit
+    def detect_new_articles() -> int | bool:
+        r = requests.get(INGESTION_LAST_ID_ENDPOINT, timeout=LAST_ID_TIMEOUT_S)
+        r.raise_for_status()
+        current_id = int(r.json()["data"])
+
+        last_notified_str = Variable.get(VAR_LAST_NOTIFIED_ARTICLE_ID, default_var="")
+        if not last_notified_str:
+            # First-deploy guard: seed the pivot silently so rollout
+            # doesn't fire on the historical backlog.
+            Variable.set(VAR_LAST_NOTIFIED_ARTICLE_ID, str(current_id))
+            return False
+
+        if current_id - int(last_notified_str) < NEW_ARTICLES_THRESHOLD:
+            return False
+        return current_id
+
+    @task
+    def advance_state(current_id: int) -> None:
+        now_utc = pendulum.now("UTC")
+        today_key = pendulum.now(AMSTERDAM).strftime("%Y_%m_%d")
+        counter_var = VAR_COUNTER_PREFIX + today_key
+
+        Variable.set(VAR_LAST_NOTIFIED_ARTICLE_ID, str(current_id))
+        Variable.set(VAR_LAST_FIRED_AT_UTC, now_utc.isoformat())
+        Variable.set(
+            counter_var,
+            str(int(Variable.get(counter_var, default_var="0")) + 1),
+        )
+
+    quiet_ok = check_quiet_hours()
+    cap_ok = check_daily_cap()
+    cool_ok = check_cooldown()
+    current_id = detect_new_articles()
 
     trigger = TriggerDagRunOperator(
         task_id="trigger_prod_notifications",
         trigger_dag_id=PROD_DAG_ID,
         trigger_run_id=(
-            "auto__{{ ti.xcom_pull(task_ids='detect_new_summarize_run')['run_id'] }}"
+            "auto__article_{{ ti.xcom_pull(task_ids='detect_new_articles') }}"
+            "__{{ ts_nodash }}"
         ),
         conf={
             "source": "auto_watcher",
-            "summarize_run_id": (
-                "{{ ti.xcom_pull(task_ids='detect_new_summarize_run')['run_id'] }}"
+            "as_of_article_id": (
+                "{{ ti.xcom_pull(task_ids='detect_new_articles') }}"
             ),
         },
         reset_dag_run=False,
         wait_for_completion=False,
     )
 
-    advance = advance_marker(summarize)
-    gated >> trigger >> advance
+    advance = advance_state(current_id)
+    quiet_ok >> cap_ok >> cool_ok >> current_id >> trigger >> advance
 
 
 snelnieuws_notifications_prod()
