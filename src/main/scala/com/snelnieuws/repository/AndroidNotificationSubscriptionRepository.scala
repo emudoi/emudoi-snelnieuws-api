@@ -34,25 +34,51 @@ class AndroidNotificationSubscriptionRepository(provideTransactor: => HikariTran
     fcmToken: String,
     frequency: Int,
     userId: Option[String] = None,
-    clientId: Option[UUID] = None
+    clientId: Option[UUID] = None,
+    notificationLanguage: String = "en"
   ): Either[Throwable, Int] =
     try
       Right(
         sql"""
           INSERT INTO android_notification_subscriptions
-            (device_id, fcm_token, frequency, user_id, client_id)
-          VALUES ($deviceId, $fcmToken, $frequency, $userId, $clientId)
+            (device_id, fcm_token, frequency, user_id, client_id, notification_language)
+          VALUES ($deviceId, $fcmToken, $frequency, $userId, $clientId, $notificationLanguage)
           ON CONFLICT (device_id) DO UPDATE SET
-            fcm_token  = EXCLUDED.fcm_token,
-            frequency  = EXCLUDED.frequency,
-            user_id    = EXCLUDED.user_id,
-            client_id  = COALESCE(EXCLUDED.client_id, android_notification_subscriptions.client_id),
-            updated_at = NOW()
+            fcm_token             = EXCLUDED.fcm_token,
+            frequency             = EXCLUDED.frequency,
+            user_id               = EXCLUDED.user_id,
+            client_id             = COALESCE(EXCLUDED.client_id, android_notification_subscriptions.client_id),
+            notification_language = EXCLUDED.notification_language,
+            updated_at            = NOW()
         """.update.run.transact(transactor).unsafeRunSync()
       )
     catch {
       case e: Exception =>
         logger.error(s"Failed to upsert Android subscription deviceId=$deviceId: ${e.getMessage}", e)
+        Left(e)
+    }
+
+  /** Per-language token bucketing for the Android clickbait dispatch
+    * flow (notifications_clickbait_tasks.txt §8). When `frequency` is
+    * Some(N), only rows whose frequency matches are returned; None
+    * broadcasts across all frequencies. Backed by
+    * idx_android_notif_sub_lang (V25 index). */
+  def findTokensByLanguageGrouped(
+    frequency: Option[Int] = None
+  ): Either[Throwable, Map[String, List[String]]] =
+    try {
+      val baseFr = fr"""SELECT notification_language, fcm_token
+                       FROM android_notification_subscriptions"""
+      val whereFr = frequency.map(f => fr"WHERE frequency = $f").getOrElse(Fragment.empty)
+      val rows = (baseFr ++ whereFr)
+        .query[(String, String)].to[List]
+        .transact(transactor).unsafeRunSync()
+      Right(rows.groupBy(_._1).view.mapValues(_.map(_._2)).toMap)
+    } catch {
+      case e: Exception =>
+        logger.error(
+          s"Failed to group Android tokens by language freq=$frequency: ${e.getMessage}", e
+        )
         Left(e)
     }
 

@@ -29,7 +29,11 @@ class NotificationSubscriptionRepository(provideTransactor: => HikariTransactor[
     frequency: Int,
     environment: String,
     userId: Option[String] = None,
-    clientId: Option[UUID] = None
+    clientId: Option[UUID] = None,
+    // notification_language defaults to "en" matching the V25 column
+    // DEFAULT. Existing callers (and older app builds that haven't
+    // shipped the new SubscribeRequest field) get 'en' implicitly.
+    notificationLanguage: String = "en"
   ): Either[Throwable, Int] = {
     val ensureUser: ConnectionIO[Int] = userId match {
       case Some(uid) =>
@@ -46,15 +50,18 @@ class NotificationSubscriptionRepository(provideTransactor: => HikariTransactor[
     val upsertSubscription: ConnectionIO[Int] =
       sql"""
         INSERT INTO notification_subscriptions
-          (device_id, apns_token, frequency, apns_environment, user_id, client_id)
-        VALUES ($deviceId, $apnsToken, $frequency, $environment, $userId, $clientId)
+          (device_id, apns_token, frequency, apns_environment, user_id, client_id,
+           notification_language)
+        VALUES ($deviceId, $apnsToken, $frequency, $environment, $userId, $clientId,
+                $notificationLanguage)
         ON CONFLICT (device_id) DO UPDATE SET
-          apns_token       = EXCLUDED.apns_token,
-          frequency        = EXCLUDED.frequency,
-          apns_environment = EXCLUDED.apns_environment,
-          user_id          = EXCLUDED.user_id,
-          client_id        = COALESCE(EXCLUDED.client_id, notification_subscriptions.client_id),
-          updated_at       = NOW()
+          apns_token            = EXCLUDED.apns_token,
+          frequency             = EXCLUDED.frequency,
+          apns_environment      = EXCLUDED.apns_environment,
+          user_id               = EXCLUDED.user_id,
+          client_id             = COALESCE(EXCLUDED.client_id, notification_subscriptions.client_id),
+          notification_language = EXCLUDED.notification_language,
+          updated_at            = NOW()
       """.update.run
 
     try
@@ -114,6 +121,33 @@ class NotificationSubscriptionRepository(provideTransactor: => HikariTransactor[
     catch {
       case e: Exception =>
         logger.error(s"Failed to fetch all subscription tokens: ${e.getMessage}", e)
+        Left(e)
+    }
+
+  /** Per-language token bucketing for the clickbait dispatch flow
+    * (notifications_clickbait_tasks.txt §8). When `frequency` is
+    * Some(N), only rows whose frequency matches are returned;
+    * frequency=None broadcasts across all frequencies in the
+    * environment. Backed by idx_notif_sub_lang_env (V25 partial
+    * index on language+environment). */
+  def findTokensByLanguageGrouped(
+    environment: String,
+    frequency: Option[Int] = None
+  ): Either[Throwable, Map[String, List[String]]] =
+    try {
+      val baseFr  = fr"""SELECT notification_language, apns_token
+                        FROM notification_subscriptions
+                        WHERE apns_environment = $environment"""
+      val freqFr  = frequency.map(f => fr"AND frequency = $f").getOrElse(Fragment.empty)
+      val rows = (baseFr ++ freqFr)
+        .query[(String, String)].to[List]
+        .transact(transactor).unsafeRunSync()
+      Right(rows.groupBy(_._1).view.mapValues(_.map(_._2)).toMap)
+    } catch {
+      case e: Exception =>
+        logger.error(
+          s"Failed to group tokens by language env=$environment freq=$frequency: ${e.getMessage}", e
+        )
         Left(e)
     }
 

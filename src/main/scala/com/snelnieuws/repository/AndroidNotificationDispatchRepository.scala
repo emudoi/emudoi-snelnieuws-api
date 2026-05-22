@@ -51,15 +51,18 @@ class AndroidNotificationDispatchRepository(provideTransactor: => HikariTransact
     sent: Int,
     failed: Int,
     title: String,
-    body: String
+    body: String,
+    topSummaryId: Option[Long] = None
   ): Either[Throwable, Long] =
     try
       Right(
         sql"""
           INSERT INTO android_notification_dispatches
-            (frequency, as_of_article_id, new_articles, sent_count, failed_count, title, body)
+            (frequency, as_of_article_id, new_articles, sent_count, failed_count,
+             title, body, top_summary_id)
           VALUES
-            ($frequency, $asOfArticleId, $newArticles, $sent, $failed, $title, $body)
+            ($frequency, $asOfArticleId, $newArticles, $sent, $failed,
+             $title, $body, $topSummaryId)
           RETURNING id
         """.query[Long].unique.transact(transactor).unsafeRunSync()
       )

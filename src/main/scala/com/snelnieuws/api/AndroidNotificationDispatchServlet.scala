@@ -49,6 +49,13 @@ class AndroidNotificationDispatchServlet(
           case Right(DispatchOutcome.Sent(response)) => response
           case Right(DispatchOutcome.Disabled) =>
             ServiceUnavailable(Map("error" -> "android notifications disabled"))
+          case Right(DispatchOutcome.NoFreshTopStory) =>
+            ServiceUnavailable(
+              Map(
+                "error"      -> "no_fresh_top_story",
+                "retry_hint" -> "fires when snelmind posts a new top story"
+              )
+            )
           case Left(e) =>
             InternalServerError(Map("error" -> s"Failed to dispatch: ${e.getMessage}"))
         }

@@ -17,13 +17,14 @@ class AndroidNotificationServiceSpec
     with Matchers
     with DatabaseTestSupport {
 
-  private lazy val articleRepo  = new ArticleRepository(Database.transactor)
-  private lazy val subRepo      = new AndroidNotificationSubscriptionRepository(Database.transactor)
-  private lazy val dispatchRepo = new AndroidNotificationDispatchRepository(Database.transactor)
-  private lazy val flagRepo     = new FeatureFlagRepository(Database.transactor)
+  private lazy val articleRepo    = new ArticleRepository(Database.transactor)
+  private lazy val subRepo        = new AndroidNotificationSubscriptionRepository(Database.transactor)
+  private lazy val dispatchRepo   = new AndroidNotificationDispatchRepository(Database.transactor)
+  private lazy val flagRepo       = new FeatureFlagRepository(Database.transactor)
+  private lazy val topSummaryRepo = new com.snelnieuws.repository.TopSummaryRepository(Database.transactor)
 
   private def newService(fcm: Option[FcmMessagingService] = None) =
-    new AndroidNotificationService(articleRepo, subRepo, dispatchRepo, flagRepo, fcm = fcm)
+    new AndroidNotificationService(articleRepo, subRepo, dispatchRepo, flagRepo, topSummaryRepo, fcm = fcm)
 
   "subscribe" should {
     "upsert a subscription row" in {

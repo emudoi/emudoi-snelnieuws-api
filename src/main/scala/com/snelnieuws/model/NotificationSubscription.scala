@@ -15,7 +15,12 @@ case class SubscribeRequest(
   // "production" | "sandbox". Defaults to "production" so iOS builds that
   // predate the field keep working — old binaries can only have shipped
   // production tokens (no sandbox build path existed before this change).
-  environment: String = "production"
+  environment: String = "production",
+  // Picker code from Languages.codes (de/fr/it/en/es/pl/nl). Defaults
+  // to "en" at the service layer when None; the V25 column also has
+  // DEFAULT 'en' so older app builds without this field stay on
+  // English without explicit handling.
+  notificationLanguage: Option[String] = None
 )
 
 case class DispatchResponse(

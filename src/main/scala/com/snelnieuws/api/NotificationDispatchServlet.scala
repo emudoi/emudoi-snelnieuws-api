@@ -58,6 +58,16 @@ class NotificationDispatchServlet(
           case Right(DispatchOutcome.Sent(response)) => response
           case Right(DispatchOutcome.Disabled) =>
             ServiceUnavailable(Map("error" -> "notifications disabled"))
+          case Right(DispatchOutcome.NoFreshTopStory) =>
+            // Distinct 503 shape so the Airflow watcher's
+            // advance-state step can detect this and SKIP the pivot
+            // advance — see notifications_clickbait_tasks.txt §8 + §9.
+            ServiceUnavailable(
+              Map(
+                "error"      -> "no_fresh_top_story",
+                "retry_hint" -> "fires when snelmind posts a new top story"
+              )
+            )
           case Left(e) =>
             InternalServerError(Map("error" -> s"Failed to dispatch: ${e.getMessage}"))
         }

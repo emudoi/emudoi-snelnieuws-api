@@ -21,10 +21,11 @@ class NotificationServiceSpec
   private lazy val subRepo          = new NotificationSubscriptionRepository(Database.transactor)
   private lazy val dispatchRepo     = new NotificationDispatchRepository(Database.transactor)
   private lazy val flagRepo         = new FeatureFlagRepository(Database.transactor)
+  private lazy val topSummaryRepo   = new com.snelnieuws.repository.TopSummaryRepository(Database.transactor)
 
   private def newService(apnsProd: Option[ApnsMessagingService] = None,
                          apnsSandbox: Option[ApnsMessagingService] = None) =
-    new NotificationService(articleRepo, subRepo, dispatchRepo, flagRepo,
+    new NotificationService(articleRepo, subRepo, dispatchRepo, flagRepo, topSummaryRepo,
       apnsProd = apnsProd, apnsSandbox = apnsSandbox)
 
   "subscribe" should {
