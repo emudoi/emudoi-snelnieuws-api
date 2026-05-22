@@ -26,6 +26,25 @@ class AndroidNotificationServiceSpec
   private def newService(fcm: Option[FcmMessagingService] = None) =
     new AndroidNotificationService(articleRepo, subRepo, dispatchRepo, flagRepo, topSummaryRepo, fcm = fcm)
 
+  /** Seed an undispatched top_summary so dispatch() finds work to do.
+    * Mirrors the helper in NotificationServiceSpec — see that file
+    * for the why. */
+  private def seedTopSummary(
+    messages: Map[String, String] = Map("en" -> "test clickbait headline")
+  ): Long = {
+    val payload = com.snelnieuws.model.TopStoryPayload(
+      representativeArticleId = scala.util.Random.nextLong().abs,
+      topNews                 = io.circe.Json.obj(),
+      notificationMessages    = messages,
+      selectionTier           = 1,
+      selectionMetadata       = io.circe.Json.obj()
+    )
+    topSummaryRepo.insert(payload).fold(
+      e => throw new RuntimeException(s"seedTopSummary failed: ${e.getMessage}"),
+      identity
+    )
+  }
+
   "subscribe" should {
     "upsert a subscription row" in {
       requireDb()
@@ -61,6 +80,9 @@ class AndroidNotificationServiceSpec
       val stub    = new StubFcmMessagingService(acceptAll = true)
       val service = newService(Some(stub))
 
+      // §8 dispatch needs a top_summary or it returns NoFreshTopStory.
+      seedTopSummary()
+
       service.dispatch(frequency = Some(3)) match {
         case Right(DispatchOutcome.Sent(resp)) =>
           resp.sent shouldBe 0
@@ -94,6 +116,10 @@ class AndroidNotificationServiceSpec
           category    = Some("and-spec")
         )
       ) shouldBe a[Right[_, _]]
+
+      // §8 dispatch needs a top_summary with notification_messages keyed
+      // by the subscribers' notification_language ("en" default).
+      seedTopSummary()
 
       service.dispatch(frequency = Some(2)) match {
         case Right(DispatchOutcome.Sent(resp)) =>
@@ -153,12 +179,19 @@ class AndroidNotificationServiceSpec
         )
       ) shouldBe a[Right[_, _]]
 
+      // §8 needs a fresh top_summary for each dispatch that expects Sent
+      // with non-zero counts — without one, dispatch returns
+      // NoFreshTopStory. seedTopSummary is called twice so the second
+      // dispatch (which expects newArticles=0) goes through the early-
+      // return Sent(0,0,0) branch and doesn't need its own seed.
+      seedTopSummary()
+
       service.dispatch(frequency = Some(1)) match {
         case Right(DispatchOutcome.Sent(resp)) => resp.newArticles should be >= 1
         case other                              => fail(s"Expected Sent, got: $other")
       }
 
-      // No new articles → 0
+      // No new articles → 0 (early-return path in §8 — no top_summary needed).
       service.dispatch(frequency = Some(1)) match {
         case Right(DispatchOutcome.Sent(resp)) => resp.newArticles shouldBe 0
         case other                              => fail(s"Expected Sent, got: $other")

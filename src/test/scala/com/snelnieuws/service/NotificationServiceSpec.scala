@@ -28,6 +28,28 @@ class NotificationServiceSpec
     new NotificationService(articleRepo, subRepo, dispatchRepo, flagRepo, topSummaryRepo,
       apnsProd = apnsProd, apnsSandbox = apnsSandbox)
 
+  /** Seed an undispatched top_summary so dispatch() finds work to do.
+    * Required by every test that exercises the post-§8 dispatch path
+    * — without one, the new flow returns DispatchOutcome.NoFreshTopStory
+    * for any non-zero newArticles count. notification_messages keys
+    * mirror the subscribers' notification_language (default "en") so
+    * the per-language fan-out picks up the configured tokens. */
+  private def seedTopSummary(
+    messages: Map[String, String] = Map("en" -> "test clickbait headline")
+  ): Long = {
+    val payload = com.snelnieuws.model.TopStoryPayload(
+      representativeArticleId = scala.util.Random.nextLong().abs,
+      topNews                 = io.circe.Json.obj(),
+      notificationMessages    = messages,
+      selectionTier           = 1,
+      selectionMetadata       = io.circe.Json.obj()
+    )
+    topSummaryRepo.insert(payload).fold(
+      e => throw new RuntimeException(s"seedTopSummary failed: ${e.getMessage}"),
+      identity
+    )
+  }
+
   "subscribe" should {
     "upsert a subscription row" in {
       requireDb()
@@ -68,6 +90,11 @@ class NotificationServiceSpec
       val stub    = new StubApnsMessagingService(acceptAll = true)
       val service = newService(apnsProd = Some(stub))
 
+      // §8 dispatch path needs a fresh top_summary; otherwise it returns
+      // NoFreshTopStory instead of Sent. Seed one with no language
+      // overlap so the per-language fan-out yields zero tokens anyway.
+      seedTopSummary()
+
       // Use a frequency tier we know has no subscribers.
       service.dispatch(frequency = Some(3), environment = "production") match {
         case Right(DispatchOutcome.Sent(resp)) =>
@@ -105,6 +132,10 @@ class NotificationServiceSpec
         )
       ) shouldBe a[Right[_, _]]
 
+      // §8 dispatch flow needs a top_summary AND non-empty notification_messages
+      // for the subscriber's notification_language ('en' default).
+      seedTopSummary()
+
       service.dispatch(frequency = Some(2), environment = "production") match {
         case Right(DispatchOutcome.Sent(resp)) =>
           resp.sent should be >= 1
@@ -124,6 +155,8 @@ class NotificationServiceSpec
       val service = newService(apnsProd = Some(stub))
 
       // Frequency=2 was just dispatched in the previous test — no fresh inserts here.
+      // newArticles==0 is the early-return path that bypasses the new top_summary
+      // lookup entirely (§8 keeps the no-op Sent(0,0,0) branch unchanged).
       service.dispatch(frequency = Some(2), environment = "production") match {
         case Right(DispatchOutcome.Sent(resp)) =>
           resp.newArticles shouldBe 0
@@ -171,6 +204,11 @@ class NotificationServiceSpec
           category    = Some("ns-spec")
         )
       ) shouldBe a[Right[_, _]]
+
+      // §8 dispatch path needs a top_summary; subscribers' default
+      // notification_language is 'en' so the seeded "en" message
+      // matches the per-language fan-out.
+      seedTopSummary()
 
       service.dispatch(frequency = Some(4), environment = "sandbox") match {
         case Right(DispatchOutcome.Sent(_)) => succeed
