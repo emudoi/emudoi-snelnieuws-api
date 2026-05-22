@@ -608,4 +608,128 @@ class NewsServletV3Spec
       }
     }
   }
+
+  // POST /v3/feed/semantic — regression coverage for the
+  // 2026-05-22 user-reported "Dutch + custom feed → English news"
+  // bug. The iOS + Android clients send `language` in the request
+  // BODY (matching the rest of the semantic-feed body-shaped
+  // params). Pre-PR #11 the server only read URL query/Accept-
+  // Language and fell back to "en", filtering the PG JOIN to
+  // English articles. Tests below assert the new behaviour:
+  //   1. body.language scopes the JOIN
+  //   2. URL ?language= still works as a fallback
+  //   3. missing/invalid language → 400
+  //   4. embedding length mismatch → 400 (existing behaviour, but
+  //      worth pinning down to the new code path)
+  "POST /v3/feed/semantic" should {
+
+    /** Make a 1024-dim placeholder embedding. The actual values
+      * don't matter for these tests — the bridge call is stubbed
+      * via ingestionApiClient (returns empty matches in this test
+      * harness because there's no in-cluster ingestion-api), so
+      * fallback always fires and we assert on the JOIN-language
+      * portion. */
+    val dummyEmb: String =
+      List.fill(1024)("0.0").mkString("[", ",", "]")
+
+    "scope the fallback feed by language read from request body" in {
+      requireDb()
+      wipeV3Rows()
+      val enId = insertV3(title = "EN article",
+        country = Some("nl"), language = "en")
+      val nlId = insertV3(title = "NL artikel",
+        country = Some("nl"), language = "nl")
+
+      val body =
+        s"""{"embedding":$dummyEmb,"language":"nl","limit":10}"""
+      post(
+        uri = "/v3/feed/semantic?country=nl",
+        body = body.getBytes("UTF-8"),
+        headers = gatedHeaders
+      ) {
+        status shouldBe 200
+        val ids = idsOf(this.body).map(_.toLong)
+        // Only the nl-tagged article should come back, not the en
+        // one. Pre-fix this returned the en article because
+        // resolveLanguage() defaulted to "en".
+        ids should contain (nlId)
+        ids should not contain enId
+      }
+      wipeV3Rows()
+    }
+
+    "fall back to URL ?language= when body omits it" in {
+      requireDb()
+      wipeV3Rows()
+      val enId = insertV3(title = "EN article",
+        country = Some("nl"), language = "en")
+      val deId = insertV3(title = "DE Artikel",
+        country = Some("nl"), language = "de")
+
+      val body = s"""{"embedding":$dummyEmb,"limit":10}"""
+      post(
+        uri = "/v3/feed/semantic?country=nl&language=de",
+        body = body.getBytes("UTF-8"),
+        headers = gatedHeaders
+      ) {
+        status shouldBe 200
+        val ids = idsOf(this.body).map(_.toLong)
+        ids should contain (deId)
+        ids should not contain enId
+      }
+      wipeV3Rows()
+    }
+
+    "prefer body language over URL ?language= when both present" in {
+      requireDb()
+      wipeV3Rows()
+      val enId = insertV3(title = "EN article",
+        country = Some("nl"), language = "en")
+      val frId = insertV3(title = "FR article",
+        country = Some("nl"), language = "fr")
+
+      // Body says fr, URL says en. Body should win.
+      val body = s"""{"embedding":$dummyEmb,"language":"fr","limit":10}"""
+      post(
+        uri = "/v3/feed/semantic?country=nl&language=en",
+        body = body.getBytes("UTF-8"),
+        headers = gatedHeaders
+      ) {
+        status shouldBe 200
+        val ids = idsOf(this.body).map(_.toLong)
+        ids should contain (frId)
+        ids should not contain enId
+      }
+      wipeV3Rows()
+    }
+
+    "return 400 when body.language is not in the supported set" in {
+      requireDb()
+      val body =
+        s"""{"embedding":$dummyEmb,"language":"xx","limit":10}"""
+      post(
+        uri = "/v3/feed/semantic?country=nl",
+        body = body.getBytes("UTF-8"),
+        headers = gatedHeaders
+      ) {
+        status shouldBe 400
+        this.body should include("language")
+      }
+    }
+
+    "return 400 when embedding is not 1024-dim" in {
+      requireDb()
+      val shortEmb = List.fill(512)("0.0").mkString("[", ",", "]")
+      val body =
+        s"""{"embedding":$shortEmb,"language":"nl","limit":10}"""
+      post(
+        uri = "/v3/feed/semantic?country=nl",
+        body = body.getBytes("UTF-8"),
+        headers = gatedHeaders
+      ) {
+        status shouldBe 400
+        this.body should include("1024")
+      }
+    }
+  }
 }
