@@ -8,13 +8,15 @@ import java.util.concurrent.{Executors, ScheduledExecutorService, ThreadFactory,
 import java.util.concurrent.atomic.AtomicBoolean
 
 object ArticleCleanupScheduler {
-  /** Floor on the table size — cleanup is skipped while the count is below
-    * this. Sized to keep the personalised-feed filter (see
-    * docs/personalised-feed-plan.md) with at least 400 candidates available
-    * even if ingestion stalls. The earlier 20-article floor was set when the
-    * feed was unfiltered and 20 was enough to render *something*; with
-    * per-client filtering we need a wider pool so heavy users do not exhaust
-    * their fresh set immediately. */
+  /** Floor on the per-language row count — cleanup is skipped for a
+    * given language while its count is below this. Sized to keep the
+    * personalised-feed filter (see docs/personalised-feed-plan.md)
+    * with at least 400 candidates available *per language* even if
+    * ingestion for that language stalls. The earlier global 400-row
+    * floor was applied table-wide, which broke down once a second
+    * language could share the table: a language with 300 rows could
+    * still be pruned because the global total exceeded 400, leaving
+    * that language's feed starved. */
   val MinArticleCount: Int = 400
 }
 
@@ -72,24 +74,36 @@ class ArticleCleanupScheduler(
   }
 
   private def runOnce(): Unit = {
-    articleRepository.count() match {
-      case Right(total) if total < ArticleCleanupScheduler.MinArticleCount =>
-        logger.info(
-          s"Cleanup: skipped — only $total article(s), below floor of " +
-            s"${ArticleCleanupScheduler.MinArticleCount}"
-        )
-      case Right(_) =>
-        val cutoff = OffsetDateTime.now().minusHours(retentionHours)
-        articleRepository.deletePublishedBefore(cutoff) match {
-          case Right(deleted) if deleted > 0 =>
-            logger.info(s"Cleanup: deleted $deleted article(s) older than $cutoff")
-          case Right(_) =>
-            logger.debug(s"Cleanup: no articles older than $cutoff")
-          case Left(e) =>
-            logger.error(s"Article cleanup tick failed: ${e.getMessage}", e)
-        }
+    articleRepository.distinctLanguages() match {
       case Left(e) =>
-        logger.error(s"Article cleanup tick failed (count): ${e.getMessage}", e)
+        logger.error(s"Article cleanup tick failed (distinctLanguages): ${e.getMessage}", e)
+      case Right(Nil) =>
+        logger.debug("Cleanup: table is empty, nothing to do")
+      case Right(langs) =>
+        val cutoff = OffsetDateTime.now().minusHours(retentionHours)
+        // Per-language loop: short-circuits per language, not across
+        // the whole tick — a failure on language X does not block
+        // language Y in the same tick.
+        langs.foreach { lang =>
+          articleRepository.countByLanguage(lang) match {
+            case Right(total) if total < ArticleCleanupScheduler.MinArticleCount =>
+              logger.info(
+                s"Cleanup[$lang]: skipped — only $total article(s), below floor of " +
+                  s"${ArticleCleanupScheduler.MinArticleCount}"
+              )
+            case Right(_) =>
+              articleRepository.deletePublishedBeforeForLanguage(lang, cutoff) match {
+                case Right(deleted) if deleted > 0 =>
+                  logger.info(s"Cleanup[$lang]: deleted $deleted article(s) older than $cutoff")
+                case Right(_) =>
+                  logger.debug(s"Cleanup[$lang]: no articles older than $cutoff")
+                case Left(e) =>
+                  logger.error(s"Article cleanup tick failed for $lang: ${e.getMessage}", e)
+              }
+            case Left(e) =>
+              logger.error(s"Article cleanup tick failed (count $lang): ${e.getMessage}", e)
+          }
+        }
     }
   }
 }

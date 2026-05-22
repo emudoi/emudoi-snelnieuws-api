@@ -1,7 +1,7 @@
 package com.snelnieuws.api
 
 import com.snelnieuws.auth.FirebaseTokenVerifier
-import com.snelnieuws.model.{ArticleV3Row, Categories}
+import com.snelnieuws.model.{ArticleV3Row, Categories, CategoryNames, Languages}
 import com.snelnieuws.repository.AppClientRepository
 import com.snelnieuws.service.{ArticleService, NotificationService, UserService}
 import com.snelnieuws.util.CursorCodec
@@ -48,6 +48,9 @@ class NewsServletV3(
 
   private val ClientHeaderRe = """^(ios|android)/[^\s]+$""".r
   private val CountryRe = """^[a-z]{2}$""".r
+  // Same shape as CountryRe — a 2-letter lowercase ISO 639-1 primary
+  // tag. Region subtags ('nl-NL') are stripped before this regex runs.
+  private val LanguageRe = """^[a-z]{2}$""".r
 
   // Default and ceiling page sizes. Anything bigger than the max would make
   // the cursor pagination meaningless and put pressure on the index.
@@ -98,6 +101,11 @@ class NewsServletV3(
       return BadRequest(Map("error" -> "country is required and must be a 2-letter lowercase code"))
     }
 
+    val language = resolveLanguage() match {
+      case Right(l)  => l
+      case Left(msg) => return BadRequest(Map("error" -> msg))
+    }
+
     val limit = params.get("limit")
       .flatMap(s => Try(s.toInt).toOption)
       .map(n => math.min(math.max(n, 1), MaxLimit))
@@ -118,7 +126,7 @@ class NewsServletV3(
         }
     }
 
-    articleRepository.findV3(country, categories, cursorOpt, limit) match {
+    articleRepository.findV3(country, language, categories, cursorOpt, limit) match {
       case Right((rows, hasMore)) =>
         val articles = rows.map(toApi)
         val nextCursor =
@@ -143,24 +151,63 @@ class NewsServletV3(
     if (!CountryRe.pattern.matcher(country).matches()) {
       BadRequest(Map("error" -> "country is required and must be a 2-letter lowercase code"))
     } else {
-      Try(params("id").toLong).toOption match {
-        case None =>
-          BadRequest(Map("error" -> s"Invalid ID format: '${params("id")}' — expected a number"))
-        case Some(id) =>
-          articleRepository.findV3ById(country, id) match {
-            case Right(Some(row)) => toApi(row)
-            case Right(None)      => NotFound(Map("error" -> "Article not found"))
-            case Left(e) =>
-              InternalServerError(Map("error" -> s"Failed to load article: ${e.getMessage}"))
+      resolveLanguage() match {
+        case Left(msg) =>
+          BadRequest(Map("error" -> msg))
+        case Right(language) =>
+          Try(params("id").toLong).toOption match {
+            case None =>
+              BadRequest(Map("error" -> s"Invalid ID format: '${params("id")}' — expected a number"))
+            case Some(id) =>
+              articleRepository.findV3ById(country, language, id) match {
+                case Right(Some(row)) => toApi(row)
+                case Right(None)      => NotFound(Map("error" -> "Article not found"))
+                case Left(e) =>
+                  InternalServerError(Map("error" -> s"Failed to load article: ${e.getMessage}"))
+              }
           }
       }
     }
   }
 
   // ──────────────────────────────── Categories ───────────────────────────
+  //
+  // BACKWARDS-COMPAT CONTRACT: the `categories` field must remain a JSON
+  // array of lowercase slug strings forever — installed apps parse it
+  // as `[String]`. The locale-aware payload is added as a sibling
+  // `categories_localized: [{code, name}]` field. Old clients ignoring
+  // unknown JSON fields (Codable / Moshi / Gson defaults — all tolerant)
+  // see no behavior change. CRITICAL: `categories[i]` and
+  // `categories_localized[i].code` refer to the same slug at the same
+  // index, regardless of locale, so positional cross-referencing works.
 
   get("/categories") {
-    Map("categories" -> Categories.all)
+    resolveLanguage() match {
+      case Right(locale) =>
+        Map(
+          "categories"            -> Categories.all,
+          "categories_localized"  -> CategoryNames.forLocale(locale)
+        )
+      case Left(msg) =>
+        BadRequest(Map("error" -> msg))
+    }
+  }
+
+  // ──────────────────────────────── Languages ────────────────────────────
+  //
+  // Same auth gate as /categories. Pure static read — no DB call.
+  // Rendering order is constant across locales; only the display
+  // `name` values change. Unknown but well-formed locales fall back to
+  // the English row (no error). Malformed locales (e.g. ?language=XYZ)
+  // 400, consistent with the list endpoints.
+
+  get("/languages") {
+    resolveLanguage() match {
+      case Right(locale) =>
+        Map("languages" -> Languages.forLocale(locale))
+      case Left(msg) =>
+        BadRequest(Map("error" -> msg))
+    }
   }
 
   // ─────────────────────────────── Internals ─────────────────────────────
@@ -180,8 +227,32 @@ class NewsServletV3(
       content     = row.content,
       category    = row.category,
       country     = row.country,
-      is_local    = row.isLocal
+      is_local    = row.isLocal,
+      language    = row.language
     )
+
+  /** Resolve the language for this request. Order of precedence:
+    *   1. `?language=xx` query param.
+    *   2. `Accept-Language` header (primary subtag — `nl-NL` → `nl`,
+    *      `fr-FR,en;q=0.9` → `fr`).
+    *   3. Default 'en'.
+    * Validates the result against the 2-letter lowercase regex. Used
+    * by every endpoint that may filter by, render in, or surface a
+    * language: handleList, /articles/:id, /categories, /languages. */
+  private[api] def resolveLanguage(): Either[String, String] = {
+    val raw = params.get("language")
+      .map(_.trim.toLowerCase)
+      .filter(_.nonEmpty)
+      .orElse(
+        Option(request.getHeader("Accept-Language"))
+          .map(_.trim.toLowerCase)
+          .filter(_.nonEmpty)
+          .map(_.split(Array(',', ';', '-')).head.trim)
+      )
+      .getOrElse("en")
+    if (LanguageRe.pattern.matcher(raw).matches()) Right(raw)
+    else Left(s"invalid language: '$raw'; must be a 2-letter lowercase code")
+  }
 
   /** Stored values starting with `/` are server-relative paths from the
     * v2 image-cache scheme (`/v2/images/...`); prepend the configured
@@ -207,7 +278,8 @@ case class ArticleV3(
   content: Option[String],
   category: Option[String],
   country: Option[String],
-  is_local: Boolean
+  is_local: Boolean,
+  language: String
 )
 
 case class PaginatedArticlesResponseV3(

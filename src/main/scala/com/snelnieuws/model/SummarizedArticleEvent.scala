@@ -7,6 +7,13 @@ import io.circe.generic.semiauto._
  * Mirror of `SummarizedArticleExport` in emudoi-snelnieuws-ingestion-api.
  * `createdAt` is Option because older producer deployments omit it; we don't
  * use it on the consumer side anyway — `publishedAt` is what lands in the table.
+ *
+ * `language` is Option[String] for the same forward-compat reason: messages
+ * emitted BEFORE the producer-side language change (V_a of
+ * language_support/backend_tasks.txt §4) still parse cleanly on this consumer
+ * because circe's deriveDecoder treats absent JSON fields as None. New
+ * messages carry Some("en"|"nl"|…) and ArticleRepository.upsertByTitle
+ * defaults None to "en" at the DB layer.
  */
 case class SummarizedArticleExport(
   author: Option[String],
@@ -19,7 +26,8 @@ case class SummarizedArticleExport(
   category: Option[String],
   sharedCategories: Option[List[String]],
   country: Option[String],
-  sharedCountries: Option[List[String]]
+  sharedCountries: Option[List[String]],
+  language: Option[String]
 )
 
 object SummarizedArticleExport {

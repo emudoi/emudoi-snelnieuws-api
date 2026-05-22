@@ -57,5 +57,6 @@ case class ArticleV3Row(
   content: Option[String],
   category: Option[String],
   country: Option[String],
-  isLocal: Boolean
+  isLocal: Boolean,
+  language: String
 )

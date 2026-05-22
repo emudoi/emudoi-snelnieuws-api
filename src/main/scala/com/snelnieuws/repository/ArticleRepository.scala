@@ -202,7 +202,11 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         Left(e)
     }
 
-  /** Delete articles whose `published_at` is older than `cutoff`. Returns row count. */
+  /** Delete articles whose `published_at` is older than `cutoff`. Returns row count.
+    *
+    * Kept for backwards compatibility (older call sites may exist). The
+    * cleanup scheduler now drives per-language deletion via
+    * [[deletePublishedBeforeForLanguage]]; prefer that for new work. */
   def deletePublishedBefore(cutoff: OffsetDateTime): Either[Throwable, Int] =
     try
       Right(
@@ -213,6 +217,55 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
     catch {
       case e: Exception =>
         logger.error(s"Failed to delete articles before $cutoff: ${e.getMessage}", e)
+        Left(e)
+    }
+
+  /** Languages currently present in the table. Order undefined. Empty
+    * list when the table is empty. Used by ArticleCleanupScheduler to
+    * fan out the per-language cleanup pass. */
+  def distinctLanguages(): Either[Throwable, List[String]] =
+    try
+      Right(
+        sql"SELECT DISTINCT language FROM articles".query[String].to[List]
+          .transact(transactor).unsafeRunSync()
+      )
+    catch {
+      case e: Exception =>
+        logger.error(s"Failed to list distinct languages: ${e.getMessage}", e)
+        Left(e)
+    }
+
+  /** Count rows for a single language. Driving the MinArticleCount
+    * floor per-language is the whole point of the cleanup rewrite — see
+    * language_support/backend_tasks.txt §13. */
+  def countByLanguage(language: String): Either[Throwable, Int] =
+    try
+      Right(
+        sql"SELECT COUNT(*) FROM articles WHERE language = $language"
+          .query[Int].unique.transact(transactor).unsafeRunSync()
+      )
+    catch {
+      case e: Exception =>
+        logger.error(s"Failed to count articles for language=$language: ${e.getMessage}", e)
+        Left(e)
+    }
+
+  /** Delete rows where language = $language AND published_at < $cutoff.
+    * Returns deleted row count. */
+  def deletePublishedBeforeForLanguage(
+    language: String,
+    cutoff: OffsetDateTime
+  ): Either[Throwable, Int] =
+    try
+      Right(
+        sql"DELETE FROM articles WHERE language = $language AND published_at < $cutoff"
+          .update.run.transact(transactor).unsafeRunSync()
+      )
+    catch {
+      case e: Exception =>
+        logger.error(
+          s"Failed to delete articles for language=$language before $cutoff: ${e.getMessage}", e
+        )
         Left(e)
     }
 
@@ -293,6 +346,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
 
   def findV3(
     country: String,
+    language: String,
     categories: List[String],
     cursor: Option[(Instant, Long)],
     limit: Int
@@ -302,9 +356,10 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
       val baseSelect = fr"""
         SELECT id, author, title, description, url, url_to_image,
                published_at, content, category, country,
-               COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local
+               COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
+               language
         FROM articles
-        WHERE TRUE
+        WHERE language = $language
       """
 
       val categoryFilter: Fragment =
@@ -330,27 +385,28 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
     } catch {
       case e: Exception =>
         logger.error(
-          s"Failed to load v3 feed country=$country categories=${categories.mkString(",")} cursor=$cursor: ${e.getMessage}",
+          s"Failed to load v3 feed country=$country language=$language categories=${categories.mkString(",")} cursor=$cursor: ${e.getMessage}",
           e
         )
         Left(e)
     }
 
   /** Single-article fetch with the same v3 projection (including `is_local`). */
-  def findV3ById(country: String, id: Long): Either[Throwable, Option[ArticleV3Row]] =
+  def findV3ById(country: String, language: String, id: Long): Either[Throwable, Option[ArticleV3Row]] =
     try
       Right(
         sql"""
           SELECT id, author, title, description, url, url_to_image,
                  published_at, content, category, country,
-                 COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local
+                 COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
+                 language
           FROM articles
-          WHERE id = $id
+          WHERE id = $id AND language = $language
         """.query[ArticleV3Row].option.transact(transactor).unsafeRunSync()
       )
     catch {
       case e: Exception =>
-        logger.error(s"Failed to load v3 article id=$id country=$country: ${e.getMessage}", e)
+        logger.error(s"Failed to load v3 article id=$id country=$country language=$language: ${e.getMessage}", e)
         Left(e)
     }
 
@@ -363,14 +419,18 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
   def upsertByTitle(article: SummarizedArticleExport): Either[Throwable, Int] =
     try {
       val publishedAt = OffsetDateTime.parse(article.publishedAt)
+      // None on the payload defaults to 'en' at the DB layer — older
+      // producer deployments that haven't yet shipped the language emit
+      // (language_support/backend_tasks.txt §4) decode to None here.
+      val language = article.language.getOrElse("en")
       Right(
         sql"""
           INSERT INTO articles (author, title, description, url, url_to_image, published_at, content,
-                                category, shared_categories, country, shared_countries)
+                                category, shared_categories, country, shared_countries, language)
           VALUES (${article.author}, ${article.title}, ${article.description},
                   ${article.url}, ${article.urlToImage}, $publishedAt, NULL,
                   ${article.category}, ${article.sharedCategories},
-                  ${article.country}, ${article.sharedCountries})
+                  ${article.country}, ${article.sharedCountries}, $language)
           ON CONFLICT (title) DO UPDATE SET
             author            = EXCLUDED.author,
             description       = EXCLUDED.description,
@@ -380,7 +440,8 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
             category          = EXCLUDED.category,
             shared_categories = EXCLUDED.shared_categories,
             country           = EXCLUDED.country,
-            shared_countries  = EXCLUDED.shared_countries
+            shared_countries  = EXCLUDED.shared_countries,
+            language          = EXCLUDED.language
         """.update.run.transact(transactor).unsafeRunSync()
       )
     } catch {

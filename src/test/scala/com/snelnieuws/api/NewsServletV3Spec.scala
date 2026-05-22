@@ -108,7 +108,8 @@ class NewsServletV3Spec
     country: Option[String] = Some("nl"),
     sharedCountries: List[String] = Nil,
     ageMinutes: Int = 0,
-    urlToImage: Option[String] = None
+    urlToImage: Option[String] = None,
+    language: String = "en"
   ): Long = {
     import doobie.implicits._
     import doobie.postgres.implicits._
@@ -121,11 +122,11 @@ class NewsServletV3Spec
       if (sharedCountries.isEmpty) None else Some(sharedCountries)
     sql"""
       INSERT INTO articles (author, title, description, url, url_to_image, published_at,
-                            content, category, shared_categories, country, shared_countries)
+                            content, category, shared_categories, country, shared_countries, language)
       VALUES ($v3Tag, $title, NULL,
               ${s"https://example.com/$v3Tag/${UUID.randomUUID()}"},
               $urlToImage, $publishedAt, NULL,
-              $category, $sharedCatsArr, $country, $sharedCntsArr)
+              $category, $sharedCatsArr, $country, $sharedCntsArr, $language)
       RETURNING id
     """.query[Long].unique.transact(Database.transactor).unsafeRunSync()
   }
@@ -382,6 +383,219 @@ class NewsServletV3Spec
         val list = (org.json4s.jackson.parseJson(body) \ "categories").extract[List[String]]
         list should contain ("politics")
         list should contain ("sports")
+      }
+    }
+
+    "also return a categories_localized sibling field in English by default" in {
+      requireDb()
+      get("/v3/categories", Map.empty[String, String], gatedHeaders) {
+        status shouldBe 200
+        val parsed = org.json4s.jackson.parseJson(body)
+        // legacy `categories` slug array stays exactly as before
+        val slugs = (parsed \ "categories").extract[List[String]]
+        slugs.head shouldBe "politics"
+        slugs.last shouldBe "other"
+        // new `categories_localized` mirrors the order index-for-index
+        val localized = (parsed \ "categories_localized").children
+        localized.size shouldBe slugs.size
+        ((localized.head \ "code").extract[String], (localized.head \ "name").extract[String]) shouldBe ("politics", "Politics")
+        ((localized.last \ "code").extract[String], (localized.last \ "name").extract[String]) shouldBe ("other", "Other")
+      }
+    }
+
+    "return Dutch names when ?language=nl is supplied" in {
+      requireDb()
+      get("/v3/categories", Map("language" -> "nl"), gatedHeaders) {
+        status shouldBe 200
+        val parsed   = org.json4s.jackson.parseJson(body)
+        val slugs    = (parsed \ "categories").extract[List[String]]
+        slugs.head shouldBe "politics"     // slug array unchanged
+        val localized = (parsed \ "categories_localized").children
+        (localized.head \ "name").extract[String] shouldBe "Politiek"
+      }
+    }
+
+    "fall back to English on an unsupported-but-well-formed locale (?language=ja)" in {
+      requireDb()
+      get("/v3/categories", Map("language" -> "ja"), gatedHeaders) {
+        status shouldBe 200
+        val parsed    = org.json4s.jackson.parseJson(body)
+        val localized = (parsed \ "categories_localized").children
+        (localized.head \ "name").extract[String] shouldBe "Politics"
+      }
+    }
+
+    "400 on malformed locale (?language=XYZ)" in {
+      requireDb()
+      get("/v3/categories", Map("language" -> "XYZ"), gatedHeaders) {
+        status shouldBe 400
+      }
+    }
+
+    "honor Accept-Language header when no ?language= is supplied" in {
+      requireDb()
+      get(
+        "/v3/categories",
+        Map.empty[String, String],
+        gatedHeaders + ("Accept-Language" -> "de-DE,en;q=0.9")
+      ) {
+        status shouldBe 200
+        val parsed    = org.json4s.jackson.parseJson(body)
+        val localized = (parsed \ "categories_localized").children
+        (localized.head \ "name").extract[String] shouldBe "Politik"
+      }
+    }
+  }
+
+  "GET /v3/languages" should {
+    "return the 7-language picker in English by default" in {
+      requireDb()
+      get("/v3/languages", Map.empty[String, String], gatedHeaders) {
+        status shouldBe 200
+        val parsed = org.json4s.jackson.parseJson(body)
+        val langs  = (parsed \ "languages").children
+        langs.size shouldBe 7
+        val codes = langs.map(l => (l \ "code").extract[String])
+        codes shouldBe List("de", "fr", "it", "en", "es", "pl", "nl")
+        val names = langs.map(l => (l \ "name").extract[String])
+        names should contain ("German")
+        names should contain ("Dutch")
+      }
+    }
+
+    "render names in Dutch when ?language=nl" in {
+      requireDb()
+      get("/v3/languages", Map("language" -> "nl"), gatedHeaders) {
+        status shouldBe 200
+        val langs = (org.json4s.jackson.parseJson(body) \ "languages").children
+        val codeToName = langs.map { l =>
+          (l \ "code").extract[String] -> (l \ "name").extract[String]
+        }.toMap
+        codeToName("de") shouldBe "Duits"
+        codeToName("nl") shouldBe "Nederlands"
+      }
+    }
+
+    "honor Accept-Language with region subtag stripped (fr-FR → fr)" in {
+      requireDb()
+      get(
+        "/v3/languages",
+        Map.empty[String, String],
+        gatedHeaders + ("Accept-Language" -> "fr-FR,en;q=0.9")
+      ) {
+        status shouldBe 200
+        val langs = (org.json4s.jackson.parseJson(body) \ "languages").children
+        val deName = langs.find(l => (l \ "code").extract[String] == "de")
+          .map(l => (l \ "name").extract[String])
+        deName shouldBe Some("Allemand")
+      }
+    }
+
+    "fall back to English on an unsupported well-formed locale" in {
+      requireDb()
+      get("/v3/languages", Map("language" -> "ja"), gatedHeaders) {
+        status shouldBe 200
+        val deName = (org.json4s.jackson.parseJson(body) \ "languages").children
+          .find(l => (l \ "code").extract[String] == "de")
+          .map(l => (l \ "name").extract[String])
+        deName shouldBe Some("German")
+      }
+    }
+
+    "400 on a malformed locale" in {
+      requireDb()
+      get("/v3/languages", Map("language" -> "XYZ"), gatedHeaders) {
+        status shouldBe 400
+      }
+    }
+
+    "403 without X-Client (auth gate applies)" in {
+      requireDb()
+      get("/v3/languages", Map.empty[String, String], Map.empty[String, String]) {
+        status shouldBe 403
+      }
+    }
+  }
+
+  "GET /v3/feed language filter" should {
+    "default to English when no ?language= and no Accept-Language" in {
+      requireDb()
+      wipeV3Rows()
+      val enId = insertV3("en-only", language = "en")
+      val nlId = insertV3("nl-only", language = "nl")
+      get("/v3/feed", Map("country" -> "nl"), gatedHeaders) {
+        status shouldBe 200
+        val ids = idsOf(body)
+        ids should contain (enId.toString)
+        ids shouldNot contain (nlId.toString)
+        // Every returned article carries language=en
+        val langs = (org.json4s.jackson.parseJson(body) \ "articles").children
+          .map(a => (a \ "language").extract[String])
+        langs.foreach(_ shouldBe "en")
+      }
+    }
+
+    "filter by ?language=nl" in {
+      requireDb()
+      wipeV3Rows()
+      val enId = insertV3("en-only-2", language = "en")
+      val nlId = insertV3("nl-only-2", language = "nl")
+      get("/v3/feed", Map("country" -> "nl", "language" -> "nl"), gatedHeaders) {
+        status shouldBe 200
+        val ids = idsOf(body)
+        ids should contain (nlId.toString)
+        ids shouldNot contain (enId.toString)
+      }
+    }
+
+    "honor Accept-Language primary subtag (nl-NL → nl)" in {
+      requireDb()
+      wipeV3Rows()
+      val enId = insertV3("en-only-3", language = "en")
+      val nlId = insertV3("nl-only-3", language = "nl")
+      get(
+        "/v3/feed",
+        Map("country" -> "nl"),
+        gatedHeaders + ("Accept-Language" -> "nl-NL,en;q=0.9")
+      ) {
+        status shouldBe 200
+        val ids = idsOf(body)
+        ids should contain (nlId.toString)
+        ids shouldNot contain (enId.toString)
+      }
+    }
+
+    "?language= beats Accept-Language" in {
+      requireDb()
+      wipeV3Rows()
+      val enId = insertV3("en-prefers-q", language = "en")
+      val nlId = insertV3("nl-only-q", language = "nl")
+      get(
+        "/v3/feed",
+        Map("country" -> "nl", "language" -> "en"),
+        gatedHeaders + ("Accept-Language" -> "nl-NL")
+      ) {
+        status shouldBe 200
+        val ids = idsOf(body)
+        ids should contain (enId.toString)
+        ids shouldNot contain (nlId.toString)
+      }
+    }
+
+    "return empty when no rows in the requested language (no error)" in {
+      requireDb()
+      wipeV3Rows()
+      insertV3("only-en", language = "en")
+      get("/v3/feed", Map("country" -> "nl", "language" -> "fr"), gatedHeaders) {
+        status shouldBe 200
+        idsOf(body) shouldBe Nil
+      }
+    }
+
+    "400 on malformed ?language= value" in {
+      requireDb()
+      get("/v3/feed", Map("country" -> "nl", "language" -> "XYZ"), gatedHeaders) {
+        status shouldBe 400
       }
     }
   }
