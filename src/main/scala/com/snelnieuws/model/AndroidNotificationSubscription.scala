@@ -14,7 +14,10 @@ package com.snelnieuws.model
 case class AndroidSubscribeRequest(
   deviceId: String,
   fcmToken: String,
-  frequency: Int
+  frequency: Int,
+  // Picker code from Languages.codes (de/fr/it/en/es/pl/nl). None →
+  // 'en' at the service layer.
+  notificationLanguage: Option[String] = None
 )
 
 case class AndroidNotificationSubscription(

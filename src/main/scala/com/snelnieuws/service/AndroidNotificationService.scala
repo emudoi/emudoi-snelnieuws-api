@@ -9,10 +9,12 @@ import com.snelnieuws.repository.{
   AndroidNotificationDispatchRepository,
   AndroidNotificationSubscriptionRepository,
   ArticleRepository,
-  FeatureFlagRepository
+  FeatureFlagRepository,
+  TopSummaryRepository
 }
 import org.slf4j.LoggerFactory
 
+import java.time.OffsetDateTime
 import java.util.UUID
 
 /** Feature-flag name guarding the Android broadcast endpoint. Symmetric to
@@ -37,6 +39,7 @@ class AndroidNotificationService(
   subscriptionRepository: AndroidNotificationSubscriptionRepository,
   dispatchRepository: AndroidNotificationDispatchRepository,
   featureFlagRepository: FeatureFlagRepository,
+  topSummaryRepository: TopSummaryRepository,
   fcm: Option[FcmMessagingService]
 ) {
 
@@ -46,18 +49,26 @@ class AndroidNotificationService(
     req: AndroidSubscribeRequest,
     userId: Option[String] = None,
     clientId: Option[UUID] = None
-  ): Either[Throwable, Int] =
+  ): Either[Throwable, Int] = {
+    val lang = req.notificationLanguage
+      .map(_.trim.toLowerCase).filter(_.nonEmpty).getOrElse("en")
     subscriptionRepository.upsert(
       req.deviceId,
       req.fcmToken,
       req.frequency,
       userId,
-      clientId
+      clientId,
+      lang
     )
+  }
 
   def deleteDevice(deviceId: String): Either[Throwable, Int] =
     subscriptionRepository.deleteByDeviceId(deviceId)
 
+  /** Mirror of NotificationService.dispatch — per-language clickbait
+    * fan-out from the latest undispatched top_summary, with
+    * NoFreshTopStory when none. See
+    * notifications_clickbait_tasks.txt §8. */
   def dispatch(frequency: Option[Int]): Either[Throwable, DispatchOutcome] =
     fcm match {
       case None =>
@@ -67,37 +78,71 @@ class AndroidNotificationService(
           lastAsOf    <- dispatchRepository.findLastAsOfArticleId(frequency)
           newArticles <- articleRepository.countSinceId(lastAsOf)
           currentMax  <- articleRepository.latestId()
-          title        = if (newArticles == 1) "1 new article" else s"$newArticles new articles"
-          body         = "Check them out in Snel Nieuws"
-          sentFailed  <- sendIfAny(client, frequency, newArticles, title, body)
-          (sent, failed) = sentFailed
-          _ <- dispatchRepository.recordDispatch(
-            frequency = frequency,
-            asOfArticleId = currentMax,
-            newArticles = newArticles,
-            sent = sent,
-            failed = failed,
-            title = title,
-            body = body
-          )
-        } yield DispatchOutcome.Sent(DispatchResponse(sent, failed, newArticles))
+          outcome     <- if (newArticles == 0) {
+                          dispatchRepository
+                            .recordDispatch(
+                              frequency = frequency,
+                              asOfArticleId = currentMax,
+                              newArticles = 0,
+                              sent = 0,
+                              failed = 0,
+                              title = "",
+                              body = "",
+                              topSummaryId = None
+                            )
+                            .map(_ => DispatchOutcome.Sent(DispatchResponse(0, 0, 0)))
+                        } else {
+                          topSummaryRepository.findLatestUndispatched().flatMap {
+                            case None =>
+                              logger.info(
+                                s"dispatch: no fresh top_summary; android freq=$frequency newArticles=$newArticles"
+                              )
+                              Right(DispatchOutcome.NoFreshTopStory)
+                            case Some(top) =>
+                              val (sent, failed) = sendByLanguage(
+                                client,
+                                frequency,
+                                top.notificationMessages
+                              )
+                              for {
+                                _ <- topSummaryRepository.markDispatched(top.id, OffsetDateTime.now())
+                                _ <- dispatchRepository.recordDispatch(
+                                  frequency      = frequency,
+                                  asOfArticleId  = currentMax,
+                                  newArticles    = newArticles,
+                                  sent           = sent,
+                                  failed         = failed,
+                                  title          = s"top_summary=${top.id}",
+                                  body           = top.notificationMessages.keys.toList.sorted.mkString(","),
+                                  topSummaryId   = Some(top.id)
+                                )
+                              } yield DispatchOutcome.Sent(DispatchResponse(sent, failed, newArticles))
+                          }
+                        }
+        } yield outcome
     }
 
-  private def sendIfAny(
+  private def sendByLanguage(
     client: FcmMessagingService,
     frequency: Option[Int],
-    newArticles: Int,
-    title: String,
-    body: String
-  ): Either[Throwable, (Int, Int)] = {
-    if (newArticles == 0) Right((0, 0))
-    else {
-      val tokensE = frequency match {
-        case Some(f) => subscriptionRepository.findTokensByFrequency(f)
-        case None    => subscriptionRepository.findAllTokens()
+    messages: Map[String, String]
+  ): (Int, Int) = {
+    val grouped = subscriptionRepository
+      .findTokensByLanguageGrouped(frequency)
+      .getOrElse(Map.empty)
+    var totalSent   = 0
+    var totalFailed = 0
+    messages.foreach { case (lang, title) =>
+      grouped.get(lang).filter(_.nonEmpty) match {
+        case None =>
+          logger.debug(s"dispatch: no Android subscribers for lang=$lang freq=$frequency")
+        case Some(tokens) =>
+          val (sent, failed) = client.sendBatch(tokens, title, "")
+          totalSent   += sent
+          totalFailed += failed
       }
-      tokensE.map(tokens => client.sendBatch(tokens, title, body))
     }
+    (totalSent, totalFailed)
   }
 
   /** Broadcast a free-form text to all Android subscribers when the

@@ -65,6 +65,20 @@ class AndroidNotificationDispatchServletSpec
 
     "return 200 with a valid X-API-Key (no subscribers, no articles)" in {
       requireDb()
+      // §8 dispatch flow requires a fresh top_summary when newArticles>0
+      // OR returns Sent(0,0,0) when newArticles==0. Earlier suites in
+      // the same DB may have inserted articles, so seed one
+      // defensively — the per-language fan-out finds no Android
+      // subscribers and returns sent=0 either way.
+      val seedPayload = com.snelnieuws.model.TopStoryPayload(
+        representativeArticleId = scala.util.Random.nextLong().abs,
+        topNews                 = io.circe.Json.obj(),
+        notificationMessages    = Map("en" -> "android dispatch-spec headline"),
+        selectionTier           = 1,
+        selectionMetadata       = io.circe.Json.obj()
+      )
+      components.topSummaryRepository.insert(seedPayload) shouldBe a[Right[_, _]]
+
       post(
         "/android/notifications/dispatch",
         Map.empty[String, String],

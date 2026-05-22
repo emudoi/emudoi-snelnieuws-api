@@ -568,6 +568,18 @@ class NewsServletSpec
         status shouldBe 201
       }
 
+      // §8 dispatch flow requires a fresh top_summary row;
+      // notification_messages keys map to subscribers'
+      // notification_language (default "en").
+      val seedPayload = com.snelnieuws.model.TopStoryPayload(
+        representativeArticleId = scala.util.Random.nextLong().abs,
+        topNews                 = io.circe.Json.obj(),
+        notificationMessages    = Map("en" -> "dispatch-spec headline"),
+        selectionTier           = 1,
+        selectionMetadata       = io.circe.Json.obj()
+      )
+      components.topSummaryRepository.insert(seedPayload) shouldBe a[Right[_, _]]
+
       post(
         "/notifications/dispatch?frequency=4",
         "",

@@ -10,16 +10,24 @@ import com.snelnieuws.repository.{
   ArticleRepository,
   FeatureFlagRepository,
   NotificationDispatchRepository,
-  NotificationSubscriptionRepository
+  NotificationSubscriptionRepository,
+  TopSummaryRepository
 }
 import org.slf4j.LoggerFactory
 
+import java.time.OffsetDateTime
 import java.util.UUID
 
 sealed trait DispatchOutcome
 object DispatchOutcome {
   case object Disabled                          extends DispatchOutcome
   case class Sent(response: DispatchResponse)   extends DispatchOutcome
+  /** Snelmind hasn't shipped a fresh top story since the last
+    * dispatched_at — the watcher MUST NOT advance its pivot/counter
+    * (notifications_clickbait_tasks.txt §8 + §10 no-fallback policy).
+    * The dispatch servlet maps this to HTTP 503 with
+    * `{"error": "no_fresh_top_story"}`. */
+  case object NoFreshTopStory                   extends DispatchOutcome
 }
 
 object NotificationEnvironment {
@@ -51,6 +59,7 @@ class NotificationService(
   subscriptionRepository: NotificationSubscriptionRepository,
   dispatchRepository: NotificationDispatchRepository,
   featureFlagRepository: FeatureFlagRepository,
+  topSummaryRepository: TopSummaryRepository,
   apnsProd: Option[ApnsMessagingService],
   apnsSandbox: Option[ApnsMessagingService]
 ) {
@@ -61,15 +70,21 @@ class NotificationService(
     req: SubscribeRequest,
     userId: Option[String] = None,
     clientId: Option[UUID] = None
-  ): Either[Throwable, Int] =
+  ): Either[Throwable, Int] = {
+    // notificationLanguage defaults to "en". Validate against the
+    // supported set via the V25 CHECK constraint — Postgres rejects
+    // an unsupported code at INSERT, which surfaces as a Left here.
+    val lang = req.notificationLanguage.map(_.trim.toLowerCase).filter(_.nonEmpty).getOrElse("en")
     subscriptionRepository.upsert(
       req.deviceId,
       req.apnsToken,
       req.frequency,
       req.environment,
       userId,
-      clientId
+      clientId,
+      lang
     )
+  }
 
   /** Delete a single device's subscription regardless of whether it was
     * linked to a user. Used by account-deletion to clean up rows whose
@@ -77,6 +92,12 @@ class NotificationService(
   def deleteDevice(deviceId: String): Either[Throwable, Int] =
     subscriptionRepository.deleteByDeviceId(deviceId)
 
+  /** Dispatch the latest undispatched top_summary's per-language
+    * clickbait text to subscribers grouped by notification_language
+    * (notifications_clickbait_tasks.txt §8). No fallback to the legacy
+    * "$N new articles" path — if no fresh top story exists,
+    * NoFreshTopStory is returned and the watcher silently skips the
+    * fire (§10 no-fallback policy, observe-and-revisit-after-7d). */
   def dispatch(
     frequency: Option[Int],
     environment: String
@@ -93,40 +114,88 @@ class NotificationService(
           lastAsOf    <- dispatchRepository.findLastAsOfArticleId(frequency, environment)
           newArticles <- articleRepository.countSinceId(lastAsOf)
           currentMax  <- articleRepository.latestId()
-          title        = if (newArticles == 1) "1 new article" else s"$newArticles new articles"
-          body         = "Check them out in Snel Nieuws"
-          sentFailed  <- sendIfAny(c, frequency, environment, newArticles, title, body)
-          (sent, failed) = sentFailed
-          _           <- dispatchRepository.recordDispatch(
-            frequency = frequency,
-            environment = environment,
-            asOfArticleId = currentMax,
-            newArticles = newArticles,
-            sent = sent,
-            failed = failed,
-            title = title,
-            body = body
-          )
-        } yield DispatchOutcome.Sent(DispatchResponse(sent, failed, newArticles))
+          outcome     <- if (newArticles == 0) {
+                          // No new articles → no fire, but record the
+                          // no-op for audit. Unchanged from legacy behavior.
+                          dispatchRepository
+                            .recordDispatch(
+                              frequency = frequency,
+                              environment = environment,
+                              asOfArticleId = currentMax,
+                              newArticles = 0,
+                              sent = 0,
+                              failed = 0,
+                              title = "",
+                              body = "",
+                              topSummaryId = None
+                            )
+                            .map(_ => DispatchOutcome.Sent(DispatchResponse(0, 0, 0)))
+                        } else {
+                          topSummaryRepository.findLatestUndispatched().flatMap {
+                            case None =>
+                              // §8 NoFreshTopStory branch. Do NOT
+                              // advance the pivot — the watcher will
+                              // retry on the next tick if/when a fresh
+                              // top story lands.
+                              logger.info(
+                                s"dispatch: no fresh top_summary; env=$environment freq=$frequency newArticles=$newArticles"
+                              )
+                              Right(DispatchOutcome.NoFreshTopStory)
+                            case Some(top) =>
+                              val (sent, failed) = sendByLanguage(
+                                c,
+                                frequency,
+                                environment,
+                                top.notificationMessages
+                              )
+                              for {
+                                _ <- topSummaryRepository.markDispatched(top.id, OffsetDateTime.now())
+                                _ <- dispatchRepository.recordDispatch(
+                                  frequency      = frequency,
+                                  environment    = environment,
+                                  asOfArticleId  = currentMax,
+                                  newArticles    = newArticles,
+                                  sent           = sent,
+                                  failed         = failed,
+                                  title          = s"top_summary=${top.id}",
+                                  body           = top.notificationMessages.keys.toList.sorted.mkString(","),
+                                  topSummaryId   = Some(top.id)
+                                )
+                              } yield DispatchOutcome.Sent(DispatchResponse(sent, failed, newArticles))
+                          }
+                        }
+        } yield outcome
     }
   }
 
-  private def sendIfAny(
+  /** Per-language fan-out. For each language present in the top
+    * summary's notificationMessages map, look up the matching
+    * subscriber tokens and send the localized title. Body is empty so
+    * the lockscreen stays single-line.
+    *
+    * Languages with no matching subscribers are silently skipped. */
+  private def sendByLanguage(
     client: ApnsMessagingService,
     frequency: Option[Int],
     environment: String,
-    newArticles: Int,
-    title: String,
-    body: String
-  ): Either[Throwable, (Int, Int)] = {
-    if (newArticles == 0) Right((0, 0))
-    else {
-      val tokensE = frequency match {
-        case Some(f) => subscriptionRepository.findTokensByFrequencyAndEnvironment(f, environment)
-        case None    => subscriptionRepository.findAllTokensByEnvironment(environment)
+    messages: Map[String, String]
+  ): (Int, Int) = {
+    val grouped = subscriptionRepository
+      .findTokensByLanguageGrouped(environment, frequency)
+      .getOrElse(Map.empty)
+    var totalSent   = 0
+    var totalFailed = 0
+    messages.foreach { case (lang, title) =>
+      grouped.get(lang).filter(_.nonEmpty) match {
+        case None =>
+          logger.debug(s"dispatch: no subscribers for lang=$lang env=$environment freq=$frequency")
+        case Some(tokens) =>
+          val (sent, failed) = client.sendBatch(tokens, title, "")
+          totalSent   += sent
+          totalFailed += failed
       }
-      tokensE.map(tokens => client.sendBatch(tokens, title, body))
     }
+    (totalSent, totalFailed)
   }
 
   /** Broadcast a free-form text to every subscriber in each environment
