@@ -321,12 +321,30 @@ class NewsServletV3(
     val country = params.get("country").map(_.trim.toLowerCase).getOrElse("")
     if (!CountryRe.pattern.matcher(country).matches())
       BadRequest(Map("error" -> "country is required and must be a 2-letter lowercase code"))
-    else resolveLanguage() match {
-      case Left(msg)       => BadRequest(Map("error" -> msg))
-      case Right(language) =>
-        val body = Try(parsedBody.extract[SemanticFeedRequest]).toOption.getOrElse(
-          SemanticFeedRequest(embedding = Nil, categories = None, limit = None, cursor = None)
-        )
+    else {
+      // Parse the body once, up-front, so we can use body.language for
+      // language resolution (the iOS + Android clients send language
+      // here rather than as a URL query — pre-fix, the server only
+      // consulted resolveLanguage() which falls back to "en" when no
+      // ?language= query is present, and the body's language was
+      // silently dropped → Dutch users saw English articles).
+      val body = Try(parsedBody.extract[SemanticFeedRequest]).toOption.getOrElse(
+        SemanticFeedRequest(embedding = Nil, categories = None, limit = None,
+                            cursor = None, language = None)
+      )
+      // Body takes precedence; URL/Accept-Language is the fallback so
+      // a future client that only sends ?language= still works.
+      val languageE: Either[String, String] = body.language
+        .map(_.trim.toLowerCase).filter(_.nonEmpty)
+        .map { l =>
+          if (LanguageRe.pattern.matcher(l).matches() && Languages.codes.contains(l)) Right(l)
+          else Left(s"language must be one of: ${Languages.codes.mkString(",")}")
+        }
+        .getOrElse(resolveLanguage())
+
+      languageE match {
+        case Left(msg)       => BadRequest(Map("error" -> msg))
+        case Right(language) =>
         val embedding: Array[Float] = body.embedding.iterator.map(_.toFloat).toArray
         if (embedding.length != 1024) {
           BadRequest(Map("error" -> "embedding must be 1024-dim", "got" -> embedding.length))
@@ -423,6 +441,7 @@ class NewsServletV3(
             semantic_fallback_reason = finalReason
           )
         }
+      }
     }
   }
 
@@ -533,7 +552,14 @@ case class SemanticFeedRequest(
   embedding: List[Double],
   categories: Option[List[String]],
   limit: Option[Int],
-  cursor: Option[String]
+  cursor: Option[String],
+  // Optional. When present, OVERRIDES the URL/Accept-Language
+  // resolution path. The iOS + Android clients send language here
+  // (matching the rest of /v3/feed/semantic's body-shaped params)
+  // rather than as a URL query — before this field existed the
+  // server ignored it, defaulted to "en", and Dutch users saw English
+  // articles bleeding past the language filter.
+  language: Option[String]
 )
 
 /** Response shape for /v3/feed/semantic. `has_more` is always false in
