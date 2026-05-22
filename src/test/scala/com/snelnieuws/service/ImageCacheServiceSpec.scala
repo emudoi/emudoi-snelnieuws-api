@@ -178,4 +178,133 @@ class ImageCacheServiceSpec extends AnyWordSpec with Matchers {
       svc.isRetryEligible(row(0, OffsetDateTime.now().minusMinutes(5))) shouldBe false
     }
   }
+
+  // ─────────────────────────── classifier ──────────────────────────────
+
+  "ImageCacheService.classifyFailure" should {
+    val tmp = Files.createTempDirectory("img-spec-").toString
+    val svc = serviceWith(explodingRepo(), tmp)
+
+    "tag java.net.http.HttpTimeoutException as Timeout (retryableSlow)" in {
+      val e   = new java.net.http.HttpTimeoutException("read timed out")
+      val cls = svc.classifyFailure(e, "https://example.com/a.jpg")
+      cls            shouldBe DownloadFailure.Timeout
+      cls.reason     shouldBe "timeout"
+      cls.statusCode shouldBe None
+      cls.retryableSlow shouldBe true
+    }
+
+    "tag UnknownHostException as ConnectionError (retryableSlow)" in {
+      val cls = svc.classifyFailure(
+        new java.net.UnknownHostException("nope"),
+        "https://nope.invalid/a.jpg"
+      )
+      cls            shouldBe DownloadFailure.ConnectionError
+      cls.reason     shouldBe "connection_error"
+      cls.retryableSlow shouldBe true
+    }
+
+    "tag ConnectException as ConnectionError" in {
+      val cls = svc.classifyFailure(new java.net.ConnectException("refused"), "https://x/")
+      cls shouldBe DownloadFailure.ConnectionError
+    }
+
+    "tag SSLException as ConnectionError" in {
+      val cls = svc.classifyFailure(new javax.net.ssl.SSLException("handshake"), "https://x/")
+      cls shouldBe DownloadFailure.ConnectionError
+    }
+
+    "tag 'non-2xx status 503' as Http5xx(503) (retryableSlow)" in {
+      val cls = svc.classifyFailure(
+        new RuntimeException("non-2xx status 503 fetching https://x/a.jpg"),
+        "https://x/a.jpg"
+      )
+      cls            shouldBe DownloadFailure.Http5xx(503)
+      cls.reason     shouldBe "http_5xx"
+      cls.statusCode shouldBe Some(503)
+      cls.retryableSlow shouldBe true
+    }
+
+    "tag 'non-2xx status 404' as Http4xx(404) (NOT retryableSlow)" in {
+      val cls = svc.classifyFailure(
+        new RuntimeException("non-2xx status 404 fetching https://x/a.jpg"),
+        "https://x/a.jpg"
+      )
+      cls            shouldBe DownloadFailure.Http4xx(404)
+      cls.statusCode shouldBe Some(404)
+      cls.retryableSlow shouldBe false
+    }
+
+    "tag 403 on a signed URL as SignedTokenExpired" in {
+      val cls = svc.classifyFailure(
+        new RuntimeException("non-2xx status 403 fetching https://reuters.com/img?auth=xyz"),
+        "https://reuters.com/img?auth=xyz"
+      )
+      cls               shouldBe DownloadFailure.SignedTokenExpired
+      cls.reason        shouldBe "signed_token_expired"
+      cls.retryableSlow shouldBe false
+    }
+
+    "tag 403 on a non-signed URL as plain Http4xx(403)" in {
+      val cls = svc.classifyFailure(
+        new RuntimeException("non-2xx status 403 fetching https://example.com/x.jpg"),
+        "https://example.com/x.jpg"
+      )
+      cls shouldBe DownloadFailure.Http4xx(403)
+    }
+
+    "tag 'image exceeds max-bytes' as Oversize (NOT retryableSlow)" in {
+      val cls = svc.classifyFailure(
+        new RuntimeException("image exceeds max-bytes (200 > 100) at https://x/a.jpg"),
+        "https://x/a.jpg"
+      )
+      cls            shouldBe DownloadFailure.Oversize
+      cls.retryableSlow shouldBe false
+    }
+
+    "tag IllegalArgumentException as UnsupportedScheme (NOT retryableSlow)" in {
+      val cls = svc.classifyFailure(
+        new IllegalArgumentException("unsupported scheme 'data' for data:image/png;base64,..."),
+        "data:image/png;base64,iVBORw0..."
+      )
+      cls            shouldBe DownloadFailure.UnsupportedScheme
+      cls.retryableSlow shouldBe false
+    }
+
+    "tag arbitrary other exceptions as Other (retryableSlow)" in {
+      val cls = svc.classifyFailure(new RuntimeException("something weird"), "https://x/")
+      cls               shouldBe DownloadFailure.Other
+      cls.retryableSlow shouldBe true
+    }
+  }
+
+  "ImageCacheService.looksSigned" should {
+    "match common signed-URL hints (case-insensitive)" in {
+      ImageCacheService.looksSigned("https://example.com/img?auth=xyz")        shouldBe true
+      ImageCacheService.looksSigned("https://example.com/img?TOKEN=abc")       shouldBe true
+      ImageCacheService.looksSigned("https://x/?X-Amz-Signature=blah")         shouldBe true
+      ImageCacheService.looksSigned("https://x/?something-else=1")             shouldBe false
+    }
+  }
+
+  "ImageCacheService.schemeOf" should {
+    "return the lowercased scheme for valid URLs" in {
+      ImageCacheService.schemeOf("https://example.com")  shouldBe "https"
+      ImageCacheService.schemeOf("HTTP://example.com")   shouldBe "http"
+      ImageCacheService.schemeOf("data:image/png;base64,XXXX") shouldBe "data"
+      ImageCacheService.schemeOf("ftp://example.com")    shouldBe "ftp"
+    }
+    "return empty string for unparseable input" in {
+      ImageCacheService.schemeOf("just a string")     shouldBe ""
+      ImageCacheService.schemeOf("///garbage//")      shouldBe ""
+    }
+  }
+
+  "ImageCacheService.parseStatusFromMsg" should {
+    "extract the HTTP status from the download() error message" in {
+      ImageCacheService.parseStatusFromMsg("non-2xx status 503 fetching https://x") shouldBe Some(503)
+      ImageCacheService.parseStatusFromMsg("non-2xx status 404 …")                  shouldBe Some(404)
+      ImageCacheService.parseStatusFromMsg("something unrelated")                   shouldBe None
+    }
+  }
 }

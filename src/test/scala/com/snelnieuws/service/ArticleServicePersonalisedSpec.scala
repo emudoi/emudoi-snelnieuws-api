@@ -60,6 +60,12 @@ class ArticleServicePersonalisedSpec
     ),
     imageDownloadWorker   = new ImageDownloadWorker(
       new ImageCacheService(explodingImageRepo(), HttpClient.newHttpClient(), imageCacheConfig),
+      // Noop producer — articles-service tests only exercise enqueue,
+      // never the retry-emit path, but the constructor needs a real ref.
+      new KafkaImageRetryProducer(bootstrapServers = "stub:0", topic = "stub") {
+        override def send(event: com.snelnieuws.model.ImageRetryEvent): Unit = ()
+        override def close(): Unit                                            = ()
+      },
       workerThreads = 1,
       queueCapacity = 8
     ),

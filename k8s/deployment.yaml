@@ -120,6 +120,15 @@ spec:
             # without any iOS-side URL-resolution code.
             - name: IMAGES_PUBLIC_BASE_URL
               value: "https://api.snel.emudoi.com"
+            # Slow-retry tier topic — fast-path failures that look
+            # retryable (timeout, connection error, 5xx, ambiguous
+            # "other") are produced here, and the in-process
+            # ImageRetrySlowConsumer reads back with a longer HttpClient
+            # timeout. Pinned in the manifest rather than left at the
+            # application.conf default so a typo can't silently route
+            # events into the wrong topic.
+            - name: IMAGES_SLOW_RETRY_TOPIC
+              value: "image-retry-slow"
           volumeMounts:
             - name: images
               mountPath: /data/images
