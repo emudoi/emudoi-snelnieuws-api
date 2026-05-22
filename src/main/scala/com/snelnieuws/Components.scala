@@ -41,6 +41,10 @@ import com.snelnieuws.service.{
   ImageCacheConfig,
   ImageCacheService,
   ImageDownloadWorker,
+  ImageRetrySlowConsumer,
+  ImageSlowConfig,
+  ImageSlowDownloader,
+  KafkaImageRetryProducer,
   NotificationService,
   PushyApnsMessagingService,
   SummarizedArticleConsumer,
@@ -140,12 +144,64 @@ class Components(
       config     = imageCacheServiceConfig
     )
 
+  // Slow-retry tier — fast-path failures classified as retryableSlow
+  // (timeout / connection error / 5xx / "other") get handed off to the
+  // image-retry-slow Kafka topic, and ImageRetrySlowConsumer (below)
+  // tries one more time with longer timeouts. Shares the
+  // kafka.summarized-import cluster (it's the same Kafka broker).
+  private val slowRetryKafka: com.snelnieuws.kafka.SummarizedImportKafkaConfig =
+    com.snelnieuws.kafka.SummarizedImportKafkaConfig.load(rootConfig)
+  private val slowRetryCfg: com.typesafe.config.Config =
+    imagesCfg.getConfig("slow-retry")
+
+  lazy val kafkaImageRetryProducer: KafkaImageRetryProducer =
+    new KafkaImageRetryProducer(
+      bootstrapServers = slowRetryKafka.bootstrapServers,
+      topic            = slowRetryCfg.getString("topic")
+    )
+
   lazy val imageDownloadWorker: ImageDownloadWorker =
     new ImageDownloadWorker(
       imageCacheService = imageCacheService,
+      retryProducer     = kafkaImageRetryProducer,
       workerThreads     = imagesCfg.getInt("worker-threads"),
       queueCapacity     = imagesCfg.getInt("queue-capacity")
     )
+
+  lazy val imageSlowDownloader: ImageSlowDownloader =
+    new ImageSlowDownloader(
+      imageCacheService = imageCacheService,
+      imageCacheRepo    = imageCacheRepository,
+      config            = imageCacheServiceConfig,
+      slowConfig = ImageSlowConfig(
+        connectTimeoutMs = slowRetryCfg.getLong("connect-timeout-ms"),
+        readTimeoutMs    = slowRetryCfg.getLong("read-timeout-ms")
+      )
+    )
+
+  lazy val imageRetrySlowConsumer: Option[ImageRetrySlowConsumer] =
+    if (slowRetryKafka.enabled) {
+      try Some(
+        new ImageRetrySlowConsumer(
+          imageCacheRepo   = imageCacheRepository,
+          slowDownloader   = imageSlowDownloader,
+          bootstrapServers = slowRetryKafka.bootstrapServers,
+          topic            = slowRetryCfg.getString("topic"),
+          consumerGroup    = slowRetryCfg.getString("consumer-group"),
+          autoOffsetReset  = slowRetryKafka.autoOffsetReset
+        )
+      )
+      catch {
+        case e: Exception =>
+          logger.error(s"Failed to construct image-retry-slow consumer: ${e.getMessage}", e)
+          None
+      }
+    } else {
+      logger.info(
+        "image-retry-slow consumer is disabled (kafka.summarized-import.enabled=false)"
+      )
+      None
+    }
 
   lazy val imageCacheCleanupScheduler: Option[ImageCacheCleanupScheduler] = {
     val cleanupCfg = imagesCfg.getConfig("cleanup")
@@ -302,6 +358,7 @@ class Components(
     imageDownloadWorker.start()
     imageCacheCleanupScheduler.foreach(_.start())
     summarizedArticleConsumer.foreach(_.start())
+    imageRetrySlowConsumer.foreach(_.start())
   }
 
   def close(): Unit = {
@@ -309,9 +366,13 @@ class Components(
     // Order matters: stop the producer of work first, then drain the
     // worker before letting the JVM exit so in-flight downloads either
     // finish or are abandoned cleanly. Cleanup schedulers are
-    // independent and can stop in any order.
+    // independent and can stop in any order. The slow-retry consumer
+    // is stopped after the fast worker so any in-flight hand-offs
+    // can land on the topic before the consumer's poll loop exits.
     summarizedArticleConsumer.foreach(_.stop())
     imageDownloadWorker.stop()
+    imageRetrySlowConsumer.foreach(_.stop())
+    kafkaImageRetryProducer.close()
     imageCacheCleanupScheduler.foreach(_.stop())
     articleCleanupScheduler.foreach(_.stop())
   }

@@ -28,7 +28,8 @@ class ImageCacheRepository(provideTransactor: => HikariTransactor[IO]) {
       Right(
         sql"""
           SELECT source_url, relative_path, content_type, size_bytes,
-                 status, downloaded_at, last_attempt_at, attempts
+                 status, downloaded_at, last_attempt_at, attempts,
+                 last_failure_reason, last_failure_status_code
           FROM image_cache
           WHERE source_url = $sourceUrl
         """.query[ImageCacheRow].option.transact(transactor).unsafeRunSync()
@@ -44,7 +45,8 @@ class ImageCacheRepository(provideTransactor: => HikariTransactor[IO]) {
       Right(
         sql"""
           SELECT source_url, relative_path, content_type, size_bytes,
-                 status, downloaded_at, last_attempt_at, attempts
+                 status, downloaded_at, last_attempt_at, attempts,
+                 last_failure_reason, last_failure_status_code
           FROM image_cache
           WHERE relative_path = $relativePath
         """.query[ImageCacheRow].option.transact(transactor).unsafeRunSync()
@@ -59,7 +61,9 @@ class ImageCacheRepository(provideTransactor: => HikariTransactor[IO]) {
     }
 
   /** Upsert success state. A retry that was previously 'failed' is promoted
-    * to 'downloaded' here — attempts is bumped so we still have a tally. */
+    * to 'downloaded' here — attempts is bumped so we still have a tally.
+    * Resets last_failure_* on success so dashboards don't keep showing
+    * stale reasons for now-healthy URLs. */
   def upsertDownloaded(
     sourceUrl: String,
     relativePath: String,
@@ -71,18 +75,22 @@ class ImageCacheRepository(provideTransactor: => HikariTransactor[IO]) {
         sql"""
           INSERT INTO image_cache
             (source_url, relative_path, content_type, size_bytes,
-             status, downloaded_at, last_attempt_at, attempts)
+             status, downloaded_at, last_attempt_at, attempts,
+             last_failure_reason, last_failure_status_code)
           VALUES
             ($sourceUrl, $relativePath, $contentType, $sizeBytes,
-             ${ImageCacheStatus.Downloaded}, NOW(), NOW(), 1)
+             ${ImageCacheStatus.Downloaded}, NOW(), NOW(), 1,
+             NULL, NULL)
           ON CONFLICT (source_url) DO UPDATE SET
-            relative_path   = EXCLUDED.relative_path,
-            content_type    = EXCLUDED.content_type,
-            size_bytes      = EXCLUDED.size_bytes,
-            status          = ${ImageCacheStatus.Downloaded},
-            downloaded_at   = NOW(),
-            last_attempt_at = NOW(),
-            attempts        = image_cache.attempts + 1
+            relative_path             = EXCLUDED.relative_path,
+            content_type              = EXCLUDED.content_type,
+            size_bytes                = EXCLUDED.size_bytes,
+            status                    = ${ImageCacheStatus.Downloaded},
+            downloaded_at             = NOW(),
+            last_attempt_at           = NOW(),
+            attempts                  = image_cache.attempts + 1,
+            last_failure_reason       = NULL,
+            last_failure_status_code  = NULL
         """.update.run.transact(transactor).unsafeRunSync()
       )
     catch {
@@ -96,25 +104,58 @@ class ImageCacheRepository(provideTransactor: => HikariTransactor[IO]) {
 
   /** Upsert failure state. relative_path is still recorded — content
     * addressing means we know it independently of whether the bytes
-    * landed, and we want it on the row in case a future retry wins. */
-  def upsertFailed(sourceUrl: String, relativePath: String): Either[Throwable, Int] =
+    * landed, and we want it on the row in case a future retry wins.
+    * reason / statusCode are surfaced from the in-process classifier. */
+  def upsertFailed(
+    sourceUrl: String,
+    relativePath: String,
+    reason: Option[String] = None,
+    statusCode: Option[Int] = None
+  ): Either[Throwable, Int] =
     try
       Right(
         sql"""
           INSERT INTO image_cache
-            (source_url, relative_path, status, last_attempt_at, attempts)
+            (source_url, relative_path, status, last_attempt_at, attempts,
+             last_failure_reason, last_failure_status_code)
           VALUES
-            ($sourceUrl, $relativePath, ${ImageCacheStatus.Failed}, NOW(), 1)
+            ($sourceUrl, $relativePath, ${ImageCacheStatus.Failed}, NOW(), 1,
+             $reason, $statusCode)
           ON CONFLICT (source_url) DO UPDATE SET
-            status          = ${ImageCacheStatus.Failed},
-            last_attempt_at = NOW(),
-            attempts        = image_cache.attempts + 1
+            status                   = ${ImageCacheStatus.Failed},
+            last_attempt_at          = NOW(),
+            attempts                 = image_cache.attempts + 1,
+            last_failure_reason      = $reason,
+            last_failure_status_code = $statusCode
         """.update.run.transact(transactor).unsafeRunSync()
       )
     catch {
       case e: Exception =>
         logger.error(
           s"Failed to mark image_cache failed url=$sourceUrl: ${e.getMessage}",
+          e
+        )
+        Left(e)
+    }
+
+  /** Bump attempts + last_attempt_at without changing status or reason —
+    * used by the slow-path consumer when its single retry attempt fails
+    * so we still tally the work without overwriting the original
+    * fast-path failure classification. */
+  def bumpAttempt(sourceUrl: String): Either[Throwable, Int] =
+    try
+      Right(
+        sql"""
+          UPDATE image_cache
+          SET attempts        = attempts + 1,
+              last_attempt_at = NOW()
+          WHERE source_url = $sourceUrl
+        """.update.run.transact(transactor).unsafeRunSync()
+      )
+    catch {
+      case e: Exception =>
+        logger.error(
+          s"Failed to bump image_cache attempt url=$sourceUrl: ${e.getMessage}",
           e
         )
         Left(e)

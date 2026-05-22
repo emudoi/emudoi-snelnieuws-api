@@ -1,7 +1,9 @@
 package com.snelnieuws.service
 
+import com.snelnieuws.model.ImageRetryEvent
 import org.slf4j.LoggerFactory
 
+import java.time.{OffsetDateTime, ZoneOffset}
 import java.util.concurrent.{
   ArrayBlockingQueue,
   ExecutorService,
@@ -24,11 +26,19 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
   * Kafka traffic. With dedup happening implicitly inside
   * ImageCacheService.resolveOrFetch (DB lookup before fetch), enqueueing
   * the same URL from multiple articles is cheap.
-  */
+  *
+  * On a ClassifiedDownloadException whose `retryableSlow=true` (timeout,
+  * connection error, 5xx, ambiguous "other"), the URL is handed off to
+  * the Kafka image-retry-slow topic. A separate in-process consumer
+  * (ImageRetrySlowConsumer) reads that topic and re-tries with a longer
+  * timeout — one attempt only. Non-retryable failures (4xx, oversize,
+  * unsupported scheme, signed-token-expired) stay 'failed' for good. */
 class ImageDownloadWorker(
   imageCacheService: ImageCacheService,
+  retryProducer: KafkaImageRetryProducer,
   workerThreads: Int,
-  queueCapacity: Int
+  queueCapacity: Int,
+  metricLogIntervalMs: Long = 60_000L
 ) {
 
   private val logger  = LoggerFactory.getLogger(classOf[ImageDownloadWorker])
@@ -56,6 +66,18 @@ class ImageDownloadWorker(
       }
     )
 
+  // Dedicated single-thread executor for the periodic metric log so it
+  // never contends with the download pool for time slices. Daemon so a
+  // botched shutdown can't keep the JVM alive.
+  private lazy val metricExecutor: ExecutorService =
+    Executors.newSingleThreadExecutor(new ThreadFactory {
+      override def newThread(r: Runnable): Thread = {
+        val t = new Thread(r, "image-download-worker-metrics")
+        t.setDaemon(true)
+        t
+      }
+    })
+
   def start(): Unit = {
     if (started.compareAndSet(false, true)) {
       logger.info(
@@ -69,6 +91,9 @@ class ImageDownloadWorker(
         })
         i += 1
       }
+      metricExecutor.submit(new Runnable {
+        override def run(): Unit = metricLoop()
+      })
     }
   }
 
@@ -80,16 +105,14 @@ class ImageDownloadWorker(
     val trimmed = Option(sourceUrl).map(_.trim).getOrElse("")
     if (trimmed.isEmpty) return false
     if (!running.get()) {
-      logger.debug(s"image worker not running; dropping url=$trimmed")
+      val total = dropped.incrementAndGet()
+      logger.info(s"image worker not running; dropping url=$trimmed droppedTotal=$total")
       return false
     }
     val ok = queue.offer(trimmed)
     if (!ok) {
       val total = dropped.incrementAndGet()
-      // Log every Nth drop to avoid hot-path spam, but keep visibility.
-      if (total == 1 || total % 100 == 0) {
-        logger.warn(s"image-download queue full; dropped $total job(s) so far (latest=$trimmed)")
-      }
+      logger.info(s"image-download queue full; dropped url=$trimmed droppedTotal=$total")
     }
     ok
   }
@@ -107,14 +130,19 @@ class ImageDownloadWorker(
         i += 1
       }
       executor.shutdown()
+      metricExecutor.shutdown()
       try {
         if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
           logger.warn("image worker did not terminate cleanly within 10s; forcing")
           executor.shutdownNow()
         }
+        if (!metricExecutor.awaitTermination(2, TimeUnit.SECONDS)) {
+          metricExecutor.shutdownNow()
+        }
       } catch {
         case _: InterruptedException =>
           executor.shutdownNow()
+          metricExecutor.shutdownNow()
           Thread.currentThread().interrupt()
       }
     }
@@ -142,10 +170,31 @@ class ImageDownloadWorker(
               logger.debug(s"image fetched ok url=$job")
             case Left(_: ImageCacheService.RetryNotDueException) =>
               // Already logged at debug inside the service.
+            case Left(e: ClassifiedDownloadException) if e.cls.retryableSlow =>
+              logger.info(
+                s"image fetch failed url=$job reason=${e.cls.reason}; handing off to slow retry"
+              )
+              try {
+                retryProducer.send(
+                  ImageRetryEvent(
+                    eventType      = ImageRetryEvent.EventTypeRetryRequested,
+                    sourceUrl      = job,
+                    originalReason = e.cls.reason,
+                    firstAttemptAt = OffsetDateTime.now(ZoneOffset.UTC).toString
+                  )
+                )
+              } catch {
+                case t: Throwable =>
+                  // A producer send failure shouldn't tear down the worker —
+                  // the row is already 'failed' in image_cache, so the
+                  // servlet will keep serving the fallback. The slow tier
+                  // just won't see this particular URL this round.
+                  logger.warn(s"image-retry producer.send failed url=$job: ${t.getMessage}")
+              }
+            case Left(e: ClassifiedDownloadException) =>
+              // Non-retryable — leave the row 'failed' and move on.
+              logger.info(s"image fetch failed permanently url=$job reason=${e.cls.reason}")
             case Left(e) =>
-              // Service has already recorded the failure; downgrade to
-              // info here so prod logs aren't dominated by upstream CDN
-              // hiccups (those are expected).
               logger.info(s"image fetch failed url=$job: ${e.getMessage}")
           }
         } catch {
@@ -157,6 +206,23 @@ class ImageDownloadWorker(
           Thread.currentThread().interrupt()
           return
       }
+    }
+  }
+
+  private def metricLoop(): Unit = {
+    while (running.get()) {
+      try {
+        Thread.sleep(metricLogIntervalMs)
+      } catch {
+        case _: InterruptedException =>
+          Thread.currentThread().interrupt()
+          return
+      }
+      // Single line so it's grep-able as a unit and aggregatable via
+      // simple log scraping.
+      logger.info(
+        s"image worker metrics: queueDepth=${queue.size()} droppedTotal=${dropped.get()}"
+      )
     }
   }
 }

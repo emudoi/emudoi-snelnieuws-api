@@ -388,4 +388,26 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         logger.error(s"Failed to upsert summarized article title='${article.title}': ${e.getMessage}", e)
         Left(e)
     }
+
+  /** Rewrite an already-upserted article's url_to_image to the fallback
+    * route. Used by SummarizedArticleConsumer when the source image URL
+    * uses an unfetchable scheme (data:/blob:/ftp:) — the row was first
+    * upserted with a content-addressed URL on the assumption that the
+    * worker would fetch the bytes, but the worker can't, so the client
+    * should see the bundled fallback directly instead of round-tripping
+    * through the servlet. */
+  def setUrlToImageFallback(title: String): Either[Throwable, Int] =
+    try
+      Right(
+        sql"""
+          UPDATE articles
+          SET url_to_image = '/v2/images/_fallback'
+          WHERE title = $title
+        """.update.run.transact(transactor).unsafeRunSync()
+      )
+    catch {
+      case e: Exception =>
+        logger.error(s"Failed to set url_to_image fallback title='$title': ${e.getMessage}", e)
+        Left(e)
+    }
 }

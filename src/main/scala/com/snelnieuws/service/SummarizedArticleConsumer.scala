@@ -119,7 +119,28 @@ class SummarizedArticleConsumer(
             // Enqueue *after* the row write so a failed enqueue can never
             // race ahead of an unwritten article. Idempotent at the
             // service layer — duplicates from re-delivery are no-ops.
-            sourceUrlOpt.foreach(imageDownloadWorker.enqueue)
+            //
+            // Skip URLs the worker can't actually fetch (data:/blob:/ftp:):
+            // enqueueing them only to immediately fail wastes attempts and
+            // dirties image_cache. The row was upserted just above with a
+            // content-addressed URL on the optimistic assumption the worker
+            // would land bytes; rewrite it to the fallback route so the
+            // client renders the bundled fallback directly.
+            sourceUrlOpt match {
+              case Some(src) if isFetchableImageUrl(src) =>
+                imageDownloadWorker.enqueue(src)
+              case Some(src) =>
+                logger.debug(s"skipping non-fetchable image url=$src title=${event.article.title}")
+                articleRepository.setUrlToImageFallback(event.article.title) match {
+                  case Right(_) => ()
+                  case Left(e2) =>
+                    logger.warn(
+                      s"Failed to set url_to_image fallback after skipping " +
+                        s"non-fetchable url=$src title=${event.article.title}: ${e2.getMessage}"
+                    )
+                }
+              case None => ()
+            }
           case Left(e) =>
             // Don't poison the partition — log and skip. Re-throwing here would block this
             // partition forever since we'd never advance the offset.
@@ -138,4 +159,15 @@ object SummarizedArticleConsumer {
   private val PollTimeout       = Duration.ofMillis(1000)
   private val MaxPollRecords    = 100
   private val ShutdownTimeoutMs = 10000L
+
+  // Schemes the fast/slow worker pair cannot fetch over HTTP. data: URLs
+  // are base64-inline payloads (no network call); blob: are browser-only
+  // memory handles; ftp: is intentionally out of scope.
+  private val UnsupportedImageSchemePrefixes: Set[String] =
+    Set("data:", "blob:", "ftp:")
+
+  def isFetchableImageUrl(url: String): Boolean = {
+    val trimmed = Option(url).map(_.trim.toLowerCase).getOrElse("")
+    trimmed.nonEmpty && !UnsupportedImageSchemePrefixes.exists(trimmed.startsWith)
+  }
 }

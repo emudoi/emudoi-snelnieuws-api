@@ -32,6 +32,48 @@ case class ImageDownloadResult(
   sizeBytes: Long
 )
 
+/** Closed set of fast-path failure shapes. The worker reads `retryableSlow`
+  * to decide whether to hand the URL to the Kafka slow-retry tier; the
+  * `reason` token is persisted to image_cache.last_failure_reason so ops
+  * can group failures without log-spelunking. */
+sealed trait DownloadFailure {
+  def reason: String
+  def statusCode: Option[Int]
+  def retryableSlow: Boolean
+}
+object DownloadFailure {
+  case object Timeout extends DownloadFailure {
+    val reason = "timeout"; val statusCode: Option[Int] = None; val retryableSlow = true
+  }
+  case object ConnectionError extends DownloadFailure {
+    val reason = "connection_error"; val statusCode: Option[Int] = None; val retryableSlow = true
+  }
+  case class Http5xx(code: Int) extends DownloadFailure {
+    val reason = "http_5xx"; val statusCode: Option[Int] = Some(code); val retryableSlow = true
+  }
+  case class Http4xx(code: Int) extends DownloadFailure {
+    val reason = "http_4xx"; val statusCode: Option[Int] = Some(code); val retryableSlow = false
+  }
+  case object Oversize extends DownloadFailure {
+    val reason = "oversize"; val statusCode: Option[Int] = None; val retryableSlow = false
+  }
+  case object UnsupportedScheme extends DownloadFailure {
+    val reason = "unsupported_scheme"; val statusCode: Option[Int] = None; val retryableSlow = false
+  }
+  case object SignedTokenExpired extends DownloadFailure {
+    val reason = "signed_token_expired"; val statusCode: Option[Int] = None; val retryableSlow = false
+  }
+  case object Other extends DownloadFailure {
+    val reason = "other"; val statusCode: Option[Int] = None; val retryableSlow = true
+  }
+}
+
+/** Wraps a fast-path download failure so the worker can pattern-match on
+  * the classified shape (and decide whether to enqueue on the slow tier)
+  * without re-classifying the raw cause. */
+class ClassifiedDownloadException(val cls: DownloadFailure, cause: Throwable)
+  extends RuntimeException(Option(cause.getMessage).getOrElse(cls.reason), cause)
+
 /** Pure URL → relative-path math + the side-effecting fetch/read paths.
   *
   * Path scheme: `<aa>/<bb>/<sha256(source_url)><ext>`
@@ -86,7 +128,9 @@ class ImageCacheService(
     *  - Otherwise: downloads, writes atomically to NFS, upserts the row.
     *
     *  On any download/write failure, the row is upserted as failed so
-    *  attempts/last_attempt_at advance and the retry policy can throttle. */
+    *  attempts/last_attempt_at advance and the retry policy can throttle.
+    *  The Left is a ClassifiedDownloadException carrying the failure
+    *  shape so the caller can decide whether to hand off to the slow tier. */
   def resolveOrFetch(sourceUrl: String): Either[Throwable, ImageDownloadResult] = {
     val trimmed = sourceUrl.trim
     if (trimmed.isEmpty) {
@@ -154,11 +198,55 @@ class ImageCacheService(
     }
   }
 
+  /** Map a Throwable from the fast-path download attempt to its
+    * DownloadFailure classification. Used by the worker (after
+    * upsertFailed runs) and by tests. */
+  def classifyFailure(e: Throwable, sourceUrl: String): DownloadFailure = e match {
+    case _: java.net.http.HttpTimeoutException =>
+      DownloadFailure.Timeout
+    case _: java.net.ConnectException
+       | _: java.net.UnknownHostException
+       | _: javax.net.ssl.SSLException
+       | _: java.net.SocketException =>
+      DownloadFailure.ConnectionError
+    case _: java.lang.IllegalArgumentException =>
+      DownloadFailure.UnsupportedScheme
+    case re: RuntimeException if re.getMessage != null &&
+         re.getMessage.startsWith("image exceeds max-bytes") =>
+      DownloadFailure.Oversize
+    case re: RuntimeException if re.getMessage != null &&
+         re.getMessage.startsWith("non-2xx status ") =>
+      parseStatusFromMsg(re.getMessage) match {
+        case Some(c) if c >= 500 => DownloadFailure.Http5xx(c)
+        case Some(c) if c == 401 || c == 403 || c == 410 =>
+          if (looksSigned(sourceUrl)) DownloadFailure.SignedTokenExpired
+          else DownloadFailure.Http4xx(c)
+        case Some(c) if c >= 400 => DownloadFailure.Http4xx(c)
+        case _                   => DownloadFailure.Other
+      }
+    case _ => DownloadFailure.Other
+  }
+
+  /** Atomically replace the bytes at the given relative path. Package-
+    * visible so the slow-tier downloader can reuse the exact same write
+    * path (NFS atomic-move + traversal guard) without duplicating it. */
+  private[service] def writeAtomicPublic(relativePath: String, bytes: Array[Byte]): Unit =
+    writeAtomic(relativePath, bytes)
+
   // ───────────────────────────── internals ─────────────────────────────
 
   private def download(sourceUrl: String): Either[Throwable, ImageDownloadResult] = {
     val relPath = pathFor(sourceUrl)
     Try {
+      // Short-circuit unsupported schemes (data:, blob:, ftp:, …) BEFORE
+      // any network attempt. Without this, the underlying URI parse / send
+      // either throws something the classifier can't tell apart from a
+      // genuine 4xx, or burns retries that can never succeed.
+      val scheme = schemeOf(sourceUrl)
+      if (!SupportedSchemes.contains(scheme)) {
+        throw new IllegalArgumentException(s"unsupported scheme '$scheme' for $sourceUrl")
+      }
+
       val req = HttpRequest
         .newBuilder()
         .uri(URI.create(sourceUrl))
@@ -208,12 +296,18 @@ class ImageCacheService(
             Right(result)
         }
       case Failure(e) =>
-        logger.warn(s"image download failed url=$sourceUrl: ${e.getMessage}")
-        repository.upsertFailed(sourceUrl, relPath) match {
-          case Right(_) => Left(e)
+        val cls = classifyFailure(e, sourceUrl)
+        logger.warn(s"image download failed url=$sourceUrl reason=${cls.reason}: ${e.getMessage}")
+        repository.upsertFailed(
+          sourceUrl    = sourceUrl,
+          relativePath = relPath,
+          reason       = Some(cls.reason),
+          statusCode   = cls.statusCode
+        ) match {
+          case Right(_) => Left(new ClassifiedDownloadException(cls, e))
           case Left(e2) =>
             logger.error(s"image_cache failure-bookkeeping also failed url=$sourceUrl: ${e2.getMessage}")
-            Left(e)
+            Left(new ClassifiedDownloadException(cls, e))
         }
     }
   }
@@ -269,6 +363,28 @@ object ImageCacheService {
     Set("jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "heic")
 
   private val HexAlphabet: Array[Char] = "0123456789abcdef".toCharArray
+
+  private[service] val SupportedSchemes: Set[String] = Set("http", "https")
+
+  // Substrings that, when present in the URL, mark it as a signed/expiring
+  // CDN URL — retrying with a longer timeout doesn't help once the token
+  // is past TTL.
+  private val SignedTokenHints: Set[String] =
+    Set("auth=", "token=", "signature=", "x-amz-signature=", "x-goog-signature=")
+
+  def schemeOf(url: String): String =
+    Try(URI.create(url).getScheme).toOption.filter(_ != null).map(_.toLowerCase).getOrElse("")
+
+  def looksSigned(url: String): Boolean = {
+    val lower = url.toLowerCase
+    SignedTokenHints.exists(lower.contains)
+  }
+
+  // download() throws RuntimeException("non-2xx status NNN fetching <url>");
+  // re-extract the code so the classifier can split 4xx vs 5xx.
+  private val NonTwoXxStatusPattern = """non-2xx status (\d+)""".r
+  def parseStatusFromMsg(msg: String): Option[Int] =
+    NonTwoXxStatusPattern.findFirstMatchIn(msg).map(_.group(1).toInt)
 
   def sha256Hex(input: String): String = {
     val md = MessageDigest.getInstance("SHA-256")

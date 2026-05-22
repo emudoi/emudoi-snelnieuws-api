@@ -57,10 +57,19 @@ class ArticleServiceSpec extends AnyWordSpec with Matchers {
     retryBackoffMinutes = 30
   )
 
+  // Noop producer — the RecordingWorker overrides enqueue so the worker's
+  // drainLoop never runs; this is wired just to satisfy the constructor.
+  private def noopRetryProducer(): KafkaImageRetryProducer =
+    new KafkaImageRetryProducer(bootstrapServers = "stub:0", topic = "stub") {
+      override def send(event: com.snelnieuws.model.ImageRetryEvent): Unit = ()
+      override def close(): Unit                                            = ()
+    }
+
   // Records enqueue calls for assertions.
   private class RecordingWorker
       extends ImageDownloadWorker(
         new ImageCacheService(explodingImageRepo(), HttpClient.newHttpClient(), baseImageConfig),
+        noopRetryProducer(),
         workerThreads = 1,
         queueCapacity = 8
       ) {
