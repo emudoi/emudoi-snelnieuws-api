@@ -345,33 +345,35 @@ class NewsServletV3(
 
           // 1. Semantic matches via the bridge.
           //
-          // language is intentionally NOT passed here. Milvus rows
-          // were embedded from the raw-article ingestion path, which
-          // currently only sees the original article language (in
-          // practice mostly 'en'). Filtering Milvus by the user's
-          // picked language drops the match count to zero whenever
-          // the picker is anything other than 'en' — every Dutch
-          // user would see `semantic_fallback: true, reason: "no_matches"`
-          // on every search.
+          // Neither language nor country is passed as a Milvus filter.
           //
-          // Instead, let Milvus return the top-K semantically nearest
-          // URLs regardless of language. The local PG JOIN below
-          // (`findV3ByUrls`) re-applies the language filter
-          // defensively, so an English article URL with no Dutch
-          // counterpart in `articles` drops out at the JOIN step.
-          // Net effect: when a Dutch counterpart of an English
-          // article exists, the user sees it; when not, the JOIN
-          // empties out and we fall back to the default feed — which
-          // is the correct behaviour for a query that has no
-          // matching content in the user's language.
+          // Milvus's snelmind_articles collection was populated by the
+          // raw-article ingestion path which records only what the
+          // upstream firehose hands it — in practice nearly every row
+          // has language='en' and country=null (the geo-IP tagger
+          // doesn't run for articles ingested from RSS feeds, which is
+          // most of them). AND-ing either filter at the Milvus level
+          // drops the match count to zero for anyone whose picker is
+          // not exactly the magic majority value. The 2026-05-22 user
+          // report ("No news for your query — China, US, Trump, Modi"
+          // with picker=Dutch+NL) was the country=nl filter killing
+          // an otherwise healthy 4-match result set; the prior commit
+          // 29db2b8 fixed the language half of the same bug.
           //
-          // minScore stays at the spec's 0.70 to keep weak matches
-          // out; country filter ditto (geo-relevance is the user's
-          // explicit pick).
+          // Instead, let Milvus return the top-K nearest URLs
+          // unconstrained. `findV3ByUrls` below already applies the
+          // language filter at the PG JOIN level (defence in depth +
+          // semantic correctness for the user's picker); country is
+          // handled by the merged result's `is_local` flag rather
+          // than as a hard filter. Net effect: the user sees Milvus
+          // hits that DO have a localized counterpart in `articles`;
+          // hits without one drop out at the JOIN and we cleanly
+          // fall back to the default feed — which is the correct
+          // behaviour when no localized content matches the query.
           val matchesE = ingestionApiClient.searchSemantic(
             embedding = embedding,
             language  = None,
-            country   = Some(country),
+            country   = None,
             limit     = MaxLimit,
             minScore  = 0.70
           )
