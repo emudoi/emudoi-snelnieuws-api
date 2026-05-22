@@ -391,6 +391,45 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         Left(e)
     }
 
+  /** v3 read keyed on a set of URLs — used by /v3/feed/semantic to
+    * fetch local article rows for the URLs Milvus returned as kNN
+    * matches (semantic_search/backend_tasks.txt §9). No cursor + no
+    * limit; the caller merges with the categorical results in memory
+    * and paginates the union there.
+    *
+    * Language + country filters still apply: the ingestion-api bridge
+    * already filters by language at the JOIN level, but applying it
+    * locally too is defence-in-depth + matches the user's picker
+    * choice when the bridge's language filter was None.
+    */
+  def findV3ByUrls(
+    urls: List[String],
+    country: String,
+    language: String
+  ): Either[Throwable, List[ArticleV3Row]] =
+    if (urls.isEmpty) Right(Nil)
+    else
+      try
+        Right(
+          sql"""
+            SELECT id, author, title, description, url, url_to_image,
+                   published_at, content, category, country,
+                   COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
+                   language
+            FROM articles
+            WHERE url = ANY($urls)
+              AND language = $language
+          """.query[ArticleV3Row].to[List].transact(transactor).unsafeRunSync()
+        )
+      catch {
+        case e: Exception =>
+          logger.error(
+            s"Failed to load v3 articles by urls count=${urls.size} country=$country language=$language: ${e.getMessage}",
+            e
+          )
+          Left(e)
+      }
+
   /** Single-article fetch with the same v3 projection (including `is_local`). */
   def findV3ById(country: String, language: String, id: Long): Either[Throwable, Option[ArticleV3Row]] =
     try

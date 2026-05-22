@@ -27,7 +27,8 @@ import com.snelnieuws.repository.{
   NotificationDispatchRepository,
   NotificationSubscriptionRepository,
   TopSummaryRepository,
-  UserRepository
+  UserRepository,
+  UserSemanticQueryRepository
 }
 import com.snelnieuws.service.{
   AndroidNotificationService,
@@ -45,9 +46,11 @@ import com.snelnieuws.service.{
   ImageRetrySlowConsumer,
   ImageSlowConfig,
   ImageSlowDownloader,
+  IngestionApiClient,
   KafkaImageRetryProducer,
   NotificationService,
   PushyApnsMessagingService,
+  SemanticQueryService,
   SummarizedArticleConsumer,
   TopStoryConsumer,
   UserService
@@ -57,6 +60,7 @@ import doobie.hikari.HikariTransactor
 import org.slf4j.LoggerFactory
 
 import java.nio.file.{Files, Paths}
+import scala.util.Try
 
 class Components(
   provideTransactor: => HikariTransactor[IO],
@@ -346,6 +350,50 @@ class Components(
       appClientRepository,
       firebaseVerifier
     )
+  // ── Semantic search (semantic_search/backend_tasks.txt) ──────────
+  //
+  // IngestionApiClient calls the X-API-Key-gated internal endpoints
+  // exposed by emudoi-snelnieuws-ingestion-api at the in-cluster
+  // service DNS hostname. The API key is rendered by Vault Agent at
+  // /vault/secrets/semantic-search-key (same value as the
+  // ingestion-api side's secret, vault path
+  // secret/data/ingestion-api/semantic-search-key).
+  lazy val ingestionApiSemanticSearchKey: String = {
+    val pathStr = Try(rootConfig.getString("ingestion-api.semantic-search-key-path"))
+      .toOption
+      .filter(_.nonEmpty)
+      .getOrElse("/vault/secrets/semantic-search-key")
+    val path = java.nio.file.Paths.get(pathStr)
+    if (java.nio.file.Files.exists(path)) {
+      val raw = new String(java.nio.file.Files.readAllBytes(path), "UTF-8").trim
+      if (raw.isEmpty) {
+        logger.warn(
+          s"ingestion-api semantic-search-key file at $pathStr is empty — /v3/embeddings/query " +
+            "and /v3/feed/semantic will fail with 503"
+        )
+      }
+      raw
+    } else {
+      logger.warn(
+        s"ingestion-api semantic-search-key file not found at $pathStr — /v3/embeddings/query " +
+          "and /v3/feed/semantic will fail with 503. Expected mount: " +
+          "vault.hashicorp.com/agent-inject-secret-semantic-search-key in k8s/deployment.yaml."
+      )
+      ""
+    }
+  }
+
+  lazy val ingestionApiClient: IngestionApiClient = new IngestionApiClient(
+    baseUrl = rootConfig.getString("ingestion-api.base-url"),
+    apiKey  = ingestionApiSemanticSearchKey
+  )
+
+  lazy val userSemanticQueryRepository: UserSemanticQueryRepository =
+    new UserSemanticQueryRepository(provideTransactor)
+
+  lazy val semanticQueryService: SemanticQueryService =
+    new SemanticQueryService(userSemanticQueryRepository, ingestionApiClient)
+
   lazy val newsServletV3: NewsServletV3 =
     new NewsServletV3(
       articleRepository,
@@ -354,7 +402,9 @@ class Components(
       userService,
       appClientRepository,
       firebaseVerifier,
-      imagesPublicBaseUrl
+      imagesPublicBaseUrl,
+      semanticQueryService,
+      ingestionApiClient
     )
   lazy val notificationDispatchServlet: NotificationDispatchServlet =
     new NotificationDispatchServlet(
