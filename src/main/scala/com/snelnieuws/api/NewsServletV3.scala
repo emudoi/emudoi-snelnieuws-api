@@ -1,9 +1,9 @@
 package com.snelnieuws.api
 
 import com.snelnieuws.auth.FirebaseTokenVerifier
-import com.snelnieuws.model.{ArticleV3Row, Categories, CategoryNames, Languages}
+import com.snelnieuws.model.{ArticleV3Row, Categories, CategoryNames, EmbedQueryRequest, Languages}
 import com.snelnieuws.repository.AppClientRepository
-import com.snelnieuws.service.{ArticleService, NotificationService, UserService}
+import com.snelnieuws.service.{ArticleService, IngestionApiClient, IngestionApiError, NotificationService, SemanticQueryService, UserService}
 import com.snelnieuws.util.CursorCodec
 import org.json4s.{DefaultFormats, Formats}
 import org.scalatra._
@@ -11,7 +11,7 @@ import org.scalatra.json.JacksonJsonSupport
 import org.slf4j.LoggerFactory
 
 import java.time.format.DateTimeFormatter
-import java.time.{Instant, ZoneOffset}
+import java.time.{Instant, OffsetDateTime, ZoneOffset}
 import java.util.UUID
 import scala.util.Try
 
@@ -38,7 +38,9 @@ class NewsServletV3(
     * absolutiseStoredUrl` does for the v1/v2 paths. Without this, the
     * apps' AsyncImage / Coil fail because `urlToImage` carries only a
     * path with no host. */
-  imagesPublicBaseUrl: String
+  imagesPublicBaseUrl: String,
+  semanticQueryService: SemanticQueryService,
+  ingestionApiClient: IngestionApiClient
 ) extends ScalatraServlet
     with JacksonJsonSupport {
 
@@ -210,6 +212,194 @@ class NewsServletV3(
     }
   }
 
+  // ────────────────────── Semantic-query CRUD endpoints ──────────────────
+  //
+  // POST   /v3/embeddings/query  — embed the user's query text via the
+  //                                 ingestion-api bridge, persist the
+  //                                 row keyed on client_id, return the
+  //                                 1024-dim vector so the app caches
+  //                                 the same value the server stored.
+  // GET    /v3/embeddings/query  — fetch the saved row by client_id;
+  //                                 if absent AND X-User-Id is present,
+  //                                 try cross-device sync via user_id.
+  // DELETE /v3/embeddings/query  — drop the row.
+  //
+  // semantic_search/backend_tasks.txt §8.
+
+  post("/embeddings/query") {
+    clientIdFromHeader() match {
+      case Left(msg)       => BadRequest(Map("error" -> msg))
+      case Right(clientId) =>
+        val req = Try(parsedBody.extract[EmbedQueryRequest]).toOption
+        val text = req.map(_.text).map(_.trim).getOrElse("")
+        if (text.isEmpty || text.length > 200) {
+          BadRequest(Map(
+            "error"  -> "text must be non-empty and <= 200 chars",
+            "length" -> text.length
+          ))
+        } else {
+          val userId = userIdFromHeader()
+          semanticQueryService.setQuery(
+            clientId  = clientId,
+            userId    = userId,
+            queryText = text,
+            language  = req.flatMap(_.language)
+          ) match {
+            case Right(emb) =>
+              Map(
+                "embedding" -> emb.toList,
+                "dim"       -> emb.length,
+                "model"     -> "multilingual-e5-large"
+              )
+            case Left(e: IngestionApiError) =>
+              logger.warn(s"embed bridge returned ${e.status}: ${e.body.take(200)}")
+              ServiceUnavailable(Map(
+                "error"  -> "embedding_service_unavailable",
+                "detail" -> e.getMessage
+              ))
+            case Left(e) =>
+              logger.error(s"embed bridge failed: ${e.getMessage}", e)
+              InternalServerError(Map("error" -> e.getMessage))
+          }
+        }
+    }
+  }
+
+  get("/embeddings/query") {
+    clientIdFromHeader() match {
+      case Left(msg)       => BadRequest(Map("error" -> msg))
+      case Right(clientId) =>
+        val userId = userIdFromHeader()
+        // 1. Try by client_id first (this device).
+        // 2. If not found AND user_id present, try by user_id
+        //    (cross-device sync).
+        val rowOpt = semanticQueryService.getQuery(clientId) match {
+          case Right(Some(r)) => Some(r)
+          case _ =>
+            userId.flatMap { uid =>
+              semanticQueryService.getQueryByUser(uid).toOption.flatten
+            }
+        }
+        rowOpt match {
+          case None =>
+            NotFound(Map("error" -> "no_saved_query"))
+          case Some(r) =>
+            Map(
+              "query_text" -> r.queryText,
+              "embedding"  -> r.embedding.toList,
+              "language"   -> r.language,
+              "updated_at" -> r.updatedAt.toString
+            )
+        }
+    }
+  }
+
+  delete("/embeddings/query") {
+    clientIdFromHeader() match {
+      case Left(msg)       => BadRequest(Map("error" -> msg))
+      case Right(clientId) =>
+        semanticQueryService.deleteQuery(clientId) match {
+          case Right(n) => Map("deleted" -> n)
+          case Left(e)  => InternalServerError(Map("error" -> e.getMessage))
+        }
+    }
+  }
+
+  // ─────────────────────── Semantic feed (UNION + fallback) ──────────────
+  //
+  // POST /v3/feed/semantic — accepts the cached embedding from the app
+  // (so we don't re-embed on every feed open), runs Milvus kNN via the
+  // bridge, joins URLs to the local articles table, optionally unions
+  // with user-selected categories, applies the language filter, and
+  // returns the merged result in chronological order.
+  //
+  // Falls back to the default feed (semantic_fallback=true) when the
+  // bridge returned no matches OR was unavailable. See
+  // semantic_search/backend_tasks.txt §9.
+
+  post("/feed/semantic") {
+    val country = params.get("country").map(_.trim.toLowerCase).getOrElse("")
+    if (!CountryRe.pattern.matcher(country).matches())
+      BadRequest(Map("error" -> "country is required and must be a 2-letter lowercase code"))
+    else resolveLanguage() match {
+      case Left(msg)       => BadRequest(Map("error" -> msg))
+      case Right(language) =>
+        val body = Try(parsedBody.extract[SemanticFeedRequest]).toOption.getOrElse(
+          SemanticFeedRequest(embedding = Nil, categories = None, limit = None, cursor = None)
+        )
+        val embedding: Array[Float] = body.embedding.iterator.map(_.toFloat).toArray
+        if (embedding.length != 1024) {
+          BadRequest(Map("error" -> "embedding must be 1024-dim", "got" -> embedding.length))
+        } else {
+          val limit = body.limit
+            .map(n => math.min(math.max(n, 1), MaxLimit))
+            .getOrElse(DefaultLimit)
+          val categories = body.categories.getOrElse(Nil)
+            .map(_.trim.toLowerCase).filter(_.nonEmpty)
+            .filter(Categories.all.toSet.contains)
+            .distinct
+          val cursorOpt: Option[(Instant, Long)] = body.cursor.flatMap(_.trim match {
+            case ""  => None
+            case raw => CursorCodec.decode(raw).toOption
+          })
+
+          // 1. Semantic matches via the bridge.
+          val matchesE = ingestionApiClient.searchSemantic(
+            embedding = embedding,
+            language  = Some(language),
+            country   = Some(country),
+            limit     = MaxLimit,
+            minScore  = 0.70
+          )
+
+          val (semanticUrls, semanticFallback, fallbackReason) = matchesE match {
+            case Right(matches) if matches.nonEmpty =>
+              (matches.map(_.url).toSet, false, None)
+            case Right(_) =>
+              (Set.empty[String], true, Some("no_matches"))
+            case Left(_) =>
+              (Set.empty[String], true, Some("service_unavailable"))
+          }
+
+          val semanticArticles: List[ArticleV3Row] =
+            if (semanticUrls.isEmpty) Nil
+            else articleRepository
+              .findV3ByUrls(semanticUrls.toList, country, language)
+              .getOrElse(Nil)
+
+          val categoryArticles: List[ArticleV3Row] =
+            if (categories.isEmpty) Nil
+            else articleRepository
+              .findV3(country, language, categories, cursorOpt, limit)
+              .map(_._1).getOrElse(Nil)
+
+          val merged: List[ArticleV3Row] =
+            (semanticArticles ++ categoryArticles)
+              .groupBy(_.id).values.map(_.head).toList
+              .sortBy(_.publishedAt)(Ordering[OffsetDateTime].reverse)
+              .take(limit)
+
+          val (finalArticles, finalFallback, finalReason) =
+            if (merged.isEmpty && semanticFallback) {
+              articleRepository.findV3(country, language, Nil, cursorOpt, limit)
+                .map(_._1) match {
+                  case Right(rows) => (rows, true, fallbackReason)
+                  case Left(_)     => (List.empty[ArticleV3Row], true, Some("service_unavailable"))
+                }
+            } else {
+              (merged, semanticFallback, fallbackReason)
+            }
+
+          PaginatedSemanticResponse(
+            articles                 = finalArticles.map(toApi),
+            has_more                 = false,
+            semantic_fallback        = finalFallback,
+            semantic_fallback_reason = finalReason
+          )
+        }
+    }
+  }
+
   // ─────────────────────────────── Internals ─────────────────────────────
 
   private val publishedAtFmt: DateTimeFormatter =
@@ -230,6 +420,25 @@ class NewsServletV3(
       is_local    = row.isLocal,
       language    = row.language
     )
+
+  /** Re-extract the client_id UUID from the X-Client-Key header. The
+    * before() block has already validated it as a UUID and verified
+    * activity, so this is a parse-only path — we just don't store it
+    * across the before/get split in Scalatra. Returns Right(uuid) on
+    * happy path (matches what before() let through). */
+  private def clientIdFromHeader(): Either[String, UUID] = {
+    val raw = Option(request.getHeader("X-Client-Key")).map(_.trim).getOrElse("")
+    Try(UUID.fromString(raw)).toOption
+      .toRight("X-Client-Key must be a UUID")
+  }
+
+  /** Optional X-User-Id header — used by the semantic-query endpoints
+    * for cross-device sync via the user_semantic_queries.user_id
+    * lookup branch. None when the header is absent or empty. */
+  private def userIdFromHeader(): Option[String] =
+    Option(request.getHeader("X-User-Id"))
+      .map(_.trim)
+      .filter(_.nonEmpty)
 
   /** Resolve the language for this request. Order of precedence:
     *   1. `?language=xx` query param.
@@ -286,4 +495,28 @@ case class PaginatedArticlesResponseV3(
   articles: List[ArticleV3],
   next_cursor: Option[String],
   has_more: Boolean
+)
+
+/** Body of POST /v3/feed/semantic. `embedding` is mandatory and must
+  * be exactly 1024 doubles; the servlet validates length before
+  * calling the bridge. `categories` is optional (defaults to []),
+  * `limit` defaults to 20 with max 50, `cursor` only meaningful for
+  * the category branch (the semantic branch is capped at top-50, no
+  * pagination). */
+case class SemanticFeedRequest(
+  embedding: List[Double],
+  categories: Option[List[String]],
+  limit: Option[Int],
+  cursor: Option[String]
+)
+
+/** Response shape for /v3/feed/semantic. `has_more` is always false in
+  * v1 because the merged set is capped at limit ≤ 50 and there's no
+  * meaningful cursor on a UNION of semantic + category. Apps that need
+  * pagination should fall back to /v3/feed. */
+case class PaginatedSemanticResponse(
+  articles: List[ArticleV3],
+  has_more: Boolean,
+  semantic_fallback: Boolean,
+  semantic_fallback_reason: Option[String]
 )

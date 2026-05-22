@@ -56,6 +56,15 @@ spec:
           {{- with secret "secret/data/snelnieuws/api/firebase" -}}
           {{ .Data.data.service_account_json }}
           {{- end }}
+        # X-API-Key for the internal bridge calls to
+        # emudoi-snelnieuws-ingestion-api (semantic_search/backend_tasks.txt §7).
+        # Same value as the ingestion-api side reads — both pods share
+        # the secret at secret/data/ingestion-api/semantic-search-key.
+        vault.hashicorp.com/agent-inject-secret-semantic-search-key: "secret/data/ingestion-api/semantic-search-key"
+        vault.hashicorp.com/agent-inject-template-semantic-search-key: |
+          {{- with secret "secret/data/ingestion-api/semantic-search-key" -}}
+          {{ .Data.data.key }}
+          {{- end }}
     spec:
       serviceAccountName: emudoi-snelnieuws-api
       imagePullSecrets:
