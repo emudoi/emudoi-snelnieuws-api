@@ -1,7 +1,7 @@
 package com.snelnieuws.service
 
 import com.snelnieuws.repository.{AppClientRepository, ArticleRepository, FeatureFlagRepository}
-import com.snelnieuws.model.{Article, ArticleCreate, ArticleRow}
+import com.snelnieuws.model.{Article, ArticleCreate, ArticleRow, ArticleV3Row}
 import org.slf4j.LoggerFactory
 
 import java.security.MessageDigest
@@ -142,6 +142,89 @@ class ArticleService(
   def findTopHeadlines(category: String, limit: Int, clientId: Option[UUID]): Either[Throwable, List[Article]] =
     if (category.isEmpty) findAll(limit, clientId)
     else findByCategory(category, limit, clientId)
+
+  // ─────────────────────── v3 personalised feed ───────────────────────
+  //
+  // NewsServletV3 was written to call `articleRepository.findV3`
+  // directly, which bypassed the personalised-feed filter entirely.
+  // Restoring it here so v3 endpoints honour `personalised_feed_enabled`
+  // the same way v2 always has. Same rotation contract:
+  //
+  //   1. flag off OR no clientId → return findV3 (cursor-paginated,
+  //      no served-id filter).
+  //   2. flag on + clientId → fetch a wider pool (findV3Pool),
+  //      filter out the client's `last_served_ids`, take `limit` from
+  //      the remainder, append to served_ids.
+  //   3. Exhausted (no unseen rows in the pool) → reset served_ids to
+  //      the freshly-served top `limit` (rotation cycle restarts).
+  //
+  // The cursor input from the client is IGNORED on the personalised
+  // path because the served_ids set already IS the pagination state.
+  // Returning `(rows, hasMore)` keeps the servlet's existing shape;
+  // hasMore is true iff the pool had more unseen rows than `limit`.
+
+  /** True when the personalised-feed flag is enabled AND a clientId
+    * is available — used by NewsServletV3 to decide between the
+    * personalised path and the legacy cursor-only path WITHOUT
+    * having to read the flag twice. */
+  def personalisedV3Available(clientId: Option[UUID]): Boolean =
+    clientId.isDefined &&
+      featureFlagRepository.isEnabled(PersonalisedFeedFlag).getOrElse(false)
+
+  /** Personalised v3 read. Returns the next `limit` articles the
+    * client has not yet been served, marks them as served, and
+    * signals `hasMore` based on the wider pool size. Caller (the
+    * servlet) is expected to have already checked
+    * `personalisedV3Available(clientId)`; if the check fails this
+    * method returns the underlying findV3 result unchanged so
+    * mis-ordered callers still get correct data. */
+  def personalisedV3Fetch(
+    clientId: Option[UUID],
+    country: String,
+    language: String,
+    categories: List[String],
+    limit: Int
+  ): Either[Throwable, (List[ArticleV3Row], Boolean)] = {
+    val flagOn = featureFlagRepository.isEnabled(PersonalisedFeedFlag).getOrElse(false)
+    (flagOn, clientId) match {
+      case (true, Some(cid)) =>
+        for {
+          pool   <- repository.findV3Pool(country, language, categories)
+          served <- appClientRepository.readServedIds(cid)
+          result <- {
+            val servedSet = served.toSet
+            val fresh = pool.filterNot(r => servedSet.contains(r.id)).take(limit)
+            if (fresh.nonEmpty) {
+              logger.info(
+                s"personalised_v3 client=${hashClient(cid)} pool=${pool.length} " +
+                  s"served=${served.size} fresh=${fresh.size} reset=false " +
+                  s"language=$language country=$country cats=${categories.mkString(",")}"
+              )
+              val hasMore = pool.count(r => !servedSet.contains(r.id)) > limit
+              appClientRepository.appendServedIds(cid, fresh.map(_.id))
+                .map(_ => (fresh, hasMore))
+            } else {
+              // Exhaust path: reset and serve top `limit` from the
+              // pool. Rotation cycle restarts — the user sees the
+              // most-recent articles again, but only because they've
+              // genuinely caught up with the entire pool.
+              val reset = pool.take(limit)
+              logger.info(
+                s"personalised_v3 client=${hashClient(cid)} pool=${pool.length} " +
+                  s"served=${served.size} fresh=0 reset=true " +
+                  s"language=$language country=$country cats=${categories.mkString(",")}"
+              )
+              appClientRepository.setServedIds(cid, reset.map(_.id))
+                .map(_ => (reset, pool.length > limit))
+            }
+          }
+        } yield result
+      case _ =>
+        // Defensive: caller should have routed elsewhere. Honour
+        // cursor=None first-page behaviour by delegating to findV3.
+        repository.findV3(country, language, categories, cursor = None, limit = limit)
+    }
+  }
 
   private def personalisedOrLegacy(
     clientId: Option[UUID],

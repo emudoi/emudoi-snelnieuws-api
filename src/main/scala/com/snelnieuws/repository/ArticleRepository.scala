@@ -391,6 +391,55 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         Left(e)
     }
 
+  /** Wider-pool variant of `findV3` used by the personalised-feed
+    * read path (ArticleService.personalisedV3Fetch). Same shape as
+    * findV3 (returns ArticleV3Row, applies language + optional
+    * categories filter, computes is_local against country) but
+    *
+    *   - NO cursor — the personalised filter (`served_ids`) IS the
+    *     pagination state; an SQL cursor on top of it would double-
+    *     count exclusions.
+    *   - WIDER limit (default 300) so the service-layer post-filter
+    *     against served_ids still has ~100 articles available even
+    *     when the client has been served 200 already.
+    *
+    * Without this method NewsServletV3 would have to use findV3 and
+    * post-filter — but findV3 only returns `limit` rows, so a client
+    * with many served_ids would get fewer-than-requested results
+    * page after page. The wider pool gives the service room to drop
+    * served rows and still hit `limit`.
+    */
+  def findV3Pool(
+    country: String,
+    language: String,
+    categories: List[String],
+    limit: Int = 300
+  ): Either[Throwable, List[ArticleV3Row]] =
+    try {
+      val lowerCats = categories.map(_.toLowerCase)
+      val baseSelect = fr"""
+        SELECT id, author, title, description, url, url_to_image,
+               published_at, content, category, country,
+               COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
+               language
+        FROM articles
+        WHERE language = $language
+      """
+      val categoryFilter: Fragment =
+        if (lowerCats.isEmpty) Fragment.empty
+        else fr"AND (LOWER(category) = ANY($lowerCats) OR shared_categories && $lowerCats::text[])"
+      val orderLimit = fr"ORDER BY published_at DESC, id DESC LIMIT $limit"
+      val q = baseSelect ++ categoryFilter ++ orderLimit
+      Right(q.query[ArticleV3Row].to[List].transact(transactor).unsafeRunSync())
+    } catch {
+      case e: Exception =>
+        logger.error(
+          s"Failed to load v3 pool country=$country language=$language categories=${categories.mkString(",")}: ${e.getMessage}",
+          e
+        )
+        Left(e)
+    }
+
   /** v3 read keyed on a set of URLs — used by /v3/feed/semantic to
     * fetch local article rows for the URLs Milvus returned as kNN
     * matches (semantic_search/backend_tasks.txt §9). No cursor + no

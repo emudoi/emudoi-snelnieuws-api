@@ -3,6 +3,7 @@ package com.snelnieuws.api
 import com.snelnieuws.auth.FirebaseTokenVerifier
 import com.snelnieuws.model.{ArticleV3Row, Categories, CategoryNames, EmbedQueryRequest, Languages}
 import com.snelnieuws.repository.AppClientRepository
+import com.snelnieuws.model.ArticleV3Row
 import com.snelnieuws.service.{ArticleService, IngestionApiClient, IngestionApiError, NotificationService, SemanticQueryService, UserService}
 import com.snelnieuws.util.CursorCodec
 import org.json4s.{DefaultFormats, Formats}
@@ -128,11 +129,44 @@ class NewsServletV3(
         }
     }
 
-    articleRepository.findV3(country, language, categories, cursorOpt, limit) match {
+    // Personalised-feed gate: when `personalised_feed_enabled` is on
+    // AND the client is authenticated (which v3 always is — the
+    // before() block above hard-fails non-UUID X-Client-Key), route
+    // through ArticleService.personalisedV3Fetch. The personalised
+    // path:
+    //
+    //   - Ignores the cursor (server-side served_ids set IS the
+    //     pagination state — a published_at cursor would double-count
+    //     exclusions).
+    //   - Returns `next_cursor = null` so the client doesn't try to
+    //     paginate; the next /v3/feed call will serve the next
+    //     unseen page automatically.
+    //   - Falls through to findV3 on the legacy path (flag off OR
+    //     no clientId) so behaviour is identical when the feature is
+    //     disabled.
+    //
+    // This restores parity with NewsServletV2's article-service
+    // routing — when the v3 migration shipped (commit 67c4a89) it
+    // called findV3 directly, accidentally cutting v3 off from the
+    // server-side served-id tracking.
+    val cidOpt = clientIdFromHeader().toOption
+    val result: Either[Throwable, (List[ArticleV3Row], Boolean)] =
+      if (articleService.personalisedV3Available(cidOpt)) {
+        articleService.personalisedV3Fetch(cidOpt, country, language, categories, limit)
+      } else {
+        articleRepository.findV3(country, language, categories, cursorOpt, limit)
+      }
+
+    result match {
       case Right((rows, hasMore)) =>
         val articles = rows.map(toApi)
+        // Cursor is meaningful ONLY on the legacy path. The
+        // personalised path uses the served_ids set; sending a
+        // next_cursor there would invite the client to paginate
+        // into stale rows. Falsy next_cursor keeps the client on
+        // the "call /v3/feed again, get fresh content" rhythm.
         val nextCursor =
-          if (hasMore && rows.nonEmpty) {
+          if (!articleService.personalisedV3Available(cidOpt) && hasMore && rows.nonEmpty) {
             val last = rows.last
             Some(CursorCodec.encode(last.publishedAt.toInstant, last.id))
           } else None
