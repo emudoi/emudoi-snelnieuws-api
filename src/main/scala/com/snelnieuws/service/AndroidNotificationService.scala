@@ -122,13 +122,6 @@ class AndroidNotificationService(
         } yield outcome
     }
 
-  /** Per-language fan-out with English fallback. Mirrors the iOS
-    * NotificationService.sendByLanguage rewrite — iterate subscriber
-    * buckets (not message languages), look up that bucket's language
-    * in `messages`, fall back to `messages.get("en")` when not
-    * present, skip only when neither is available. See
-    * NotificationService.sendByLanguage for the full rationale +
-    * the 2026-05-22 incident it guards against. */
   private def sendByLanguage(
     client: FcmMessagingService,
     frequency: Option[Int],
@@ -137,34 +130,16 @@ class AndroidNotificationService(
     val grouped = subscriptionRepository
       .findTokensByLanguageGrouped(frequency)
       .getOrElse(Map.empty)
-    val englishFallback: Option[String] = messages.get("en")
     var totalSent   = 0
     var totalFailed = 0
-    grouped.foreach { case (subscriberLang, tokens) =>
-      if (tokens.isEmpty) {
-        // Empty bucket — skip without log noise.
-      } else {
-        val title: Option[String] = messages.get(subscriberLang).orElse(englishFallback)
-        title match {
-          case None =>
-            logger.warn(
-              s"dispatch: no Android message for subscriberLang=$subscriberLang and no `en` fallback in " +
-                s"top_summary (keys=${messages.keys.toList.sorted.mkString(",")}); " +
-                s"${tokens.size} subscribers skipped freq=$frequency"
-            )
-          case Some(t) =>
-            val isFallback = !messages.contains(subscriberLang)
-            if (isFallback) {
-              logger.info(
-                s"dispatch: english_fallback Android subscriberLang=$subscriberLang " +
-                  s"tokens=${tokens.size} freq=$frequency " +
-                  s"top_summary_keys=${messages.keys.toList.sorted.mkString(",")}"
-              )
-            }
-            val (sent, failed) = client.sendBatch(tokens, t, "")
-            totalSent   += sent
-            totalFailed += failed
-        }
+    messages.foreach { case (lang, title) =>
+      grouped.get(lang).filter(_.nonEmpty) match {
+        case None =>
+          logger.debug(s"dispatch: no Android subscribers for lang=$lang freq=$frequency")
+        case Some(tokens) =>
+          val (sent, failed) = client.sendBatch(tokens, title, "")
+          totalSent   += sent
+          totalFailed += failed
       }
     }
     (totalSent, totalFailed)
