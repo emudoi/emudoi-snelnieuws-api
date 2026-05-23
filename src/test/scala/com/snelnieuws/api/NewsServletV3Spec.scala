@@ -609,6 +609,155 @@ class NewsServletV3Spec
     }
   }
 
+  // Personalised feed coverage for v3.
+  //
+  // Pre-fix (commit 67c4a89, v3 migration), NewsServletV3 called
+  // articleRepository.findV3 directly and bypassed the personalised-
+  // feed read path entirely. The `personalised_feed_enabled` flag
+  // was on in production, app_clients.last_served_ids kept getting
+  // written by old v2 calls (which stopped happening when the apps
+  // migrated to v3), but v3 ignored both. Users saw the same top-of-
+  // feed articles on every fetch.
+  //
+  // Tests below verify the restored behaviour:
+  //   1. Flag off → /v3/feed returns the cursor-paginated default.
+  //      next_cursor is non-null when has_more.
+  //   2. Flag on + valid client_id → first fetch returns up to N
+  //      articles AND records them in app_clients.last_served_ids.
+  //   3. Flag on, second fetch → returns the NEXT batch (the ones
+  //      not in served_ids); the first batch's IDs do NOT reappear.
+  //   4. Flag on, served_ids covers entire pool → server resets
+  //      served_ids to the freshly-served top N (rotation cycle).
+
+  private def setPersonalisedFlag(enabled: Boolean): Unit = {
+    import doobie.implicits._
+    import cats.effect.unsafe.implicits.global
+    sql"UPDATE feature_flags SET is_enabled = $enabled WHERE feature = 'personalised_feed_enabled'"
+      .update.run.transact(Database.transactor).unsafeRunSync()
+  }
+
+  private def readServedIds(): List[Long] = {
+    import doobie.implicits._
+    import doobie.postgres.implicits._
+    import cats.effect.unsafe.implicits.global
+    import java.util.UUID
+    val cid: UUID = UUID.fromString(gateClientId)
+    val raw: Option[String] =
+      sql"SELECT last_served_ids::text FROM app_clients WHERE client_id = $cid"
+        .query[Option[String]].unique.transact(Database.transactor).unsafeRunSync()
+    raw match {
+      case Some(json) if json.nonEmpty =>
+        org.json4s.jackson.parseJson(json).extract[List[Long]]
+      case _ => Nil
+    }
+  }
+
+  private def resetServedIds(): Unit = {
+    import doobie.implicits._
+    import doobie.postgres.implicits._
+    import cats.effect.unsafe.implicits.global
+    import java.util.UUID
+    val cid: UUID = UUID.fromString(gateClientId)
+    val emptyJson = "[]"
+    sql"UPDATE app_clients SET last_served_ids = $emptyJson::jsonb WHERE client_id = $cid"
+      .update.run.transact(Database.transactor).unsafeRunSync()
+  }
+
+  "GET /v3/feed (personalised)" should {
+    "with flag OFF: paginate by cursor and NOT mark served_ids" in {
+      requireDb()
+      setPersonalisedFlag(false)
+      resetServedIds()
+      wipeAllArticles()
+      (1 to 6).foreach { i =>
+        insertV3(title = s"$v3Tag-flagoff-$i", country = Some("nl"), ageMinutes = i)
+      }
+      get("/v3/feed", Map("country" -> "nl", "limit" -> "3"), gatedHeaders) {
+        status shouldBe 200
+        idsOf(body) should have size 3
+        // Cursor-based pagination → next_cursor non-null when more.
+        field[String](body, "next_cursor") shouldBe defined
+      }
+      readServedIds() shouldBe empty
+    }
+
+    "with flag ON: first fetch returns N articles AND populates last_served_ids" in {
+      requireDb()
+      setPersonalisedFlag(true)
+      resetServedIds()
+      wipeAllArticles()
+      val seeded = (1 to 6).map { i =>
+        insertV3(title = s"$v3Tag-pers-$i", country = Some("nl"), ageMinutes = i)
+      }.toList
+      val firstBatch: List[Long] =
+        get("/v3/feed", Map("country" -> "nl", "limit" -> "3"), gatedHeaders) {
+          status shouldBe 200
+          val ids = idsOf(body).map(_.toLong)
+          ids should have size 3
+          // Personalised path: cursor must be NULL (server's served_ids
+          // set IS the pagination state).
+          field[String](body, "next_cursor") shouldBe empty
+          ids
+        }
+      readServedIds().toSet should contain allElementsOf firstBatch.toSet
+      setPersonalisedFlag(false)  // cleanup
+    }
+
+    "with flag ON + served_ids present: second fetch excludes the first batch" in {
+      requireDb()
+      setPersonalisedFlag(true)
+      resetServedIds()
+      wipeAllArticles()
+      (1 to 6).foreach { i =>
+        insertV3(title = s"$v3Tag-pers2-$i", country = Some("nl"), ageMinutes = i)
+      }
+      val firstBatch =
+        get("/v3/feed", Map("country" -> "nl", "limit" -> "3"), gatedHeaders) {
+          status shouldBe 200
+          idsOf(body).map(_.toLong)
+        }
+      val secondBatch =
+        get("/v3/feed", Map("country" -> "nl", "limit" -> "3"), gatedHeaders) {
+          status shouldBe 200
+          idsOf(body).map(_.toLong)
+        }
+      firstBatch.toSet.intersect(secondBatch.toSet) shouldBe empty
+      // served_ids must contain BOTH batches after the two calls.
+      readServedIds().toSet should contain allElementsOf (firstBatch.toSet ++ secondBatch.toSet)
+      setPersonalisedFlag(false)
+    }
+
+    "with flag ON + pool exhausted: resets served_ids and serves top N (rotation)" in {
+      requireDb()
+      setPersonalisedFlag(true)
+      resetServedIds()
+      wipeAllArticles()
+      // Seed exactly 3 articles. Serve all 3 (fills served_ids), then
+      // serve again — the second call must rotate (reset served_ids
+      // to the freshly-served top 3) and return them again.
+      val seeded = (1 to 3).map { i =>
+        insertV3(title = s"$v3Tag-rotate-$i", country = Some("nl"), ageMinutes = i)
+      }.toList
+      val firstBatch =
+        get("/v3/feed", Map("country" -> "nl", "limit" -> "3"), gatedHeaders) {
+          status shouldBe 200
+          idsOf(body).map(_.toLong)
+        }
+      firstBatch.toSet shouldBe seeded.toSet
+      val secondBatch =
+        get("/v3/feed", Map("country" -> "nl", "limit" -> "3"), gatedHeaders) {
+          status shouldBe 200
+          idsOf(body).map(_.toLong)
+        }
+      // Rotation: pool was exhausted (all 3 in served_ids), reset
+      // fires, the top 3 are served again. They're the SAME 3.
+      secondBatch.toSet shouldBe seeded.toSet
+      // served_ids now contains the rotated set, NOT a superset.
+      readServedIds().toSet shouldBe seeded.toSet
+      setPersonalisedFlag(false)
+    }
+  }
+
   // POST /v3/feed/semantic — regression coverage for the
   // 2026-05-22 user-reported "Dutch + custom feed → English news"
   // bug. The iOS + Android clients send `language` in the request
