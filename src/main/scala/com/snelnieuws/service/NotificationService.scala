@@ -168,12 +168,30 @@ class NotificationService(
     }
   }
 
-  /** Per-language fan-out. For each language present in the top
-    * summary's notificationMessages map, look up the matching
-    * subscriber tokens and send the localized title. Body is empty so
-    * the lockscreen stays single-line.
+  /** Per-language fan-out with English fallback.
     *
-    * Languages with no matching subscribers are silently skipped. */
+    * Iteration model:
+    *   1. For each subscriber-language bucket present in
+    *      `findTokensByLanguageGrouped`, look up that language in
+    *      `messages`. If a per-language message exists, send it.
+    *   2. If no per-language message exists for that bucket, fall back
+    *      to `messages.get("en")`. English is the snelnieuws-api default
+    *      `notification_language` (schema default + CHECK constraint
+    *      list); a subscriber whose picker is some other language
+    *      that the top_summary doesn't carry should still get a
+    *      notification rather than be silently skipped.
+    *   3. If neither the bucket's language NOR `en` is in `messages`,
+    *      skip — there's literally no text we can deliver.
+    *
+    * This guards against the 2026-05-22 incident: a temporary
+    * TARGET_LANGUAGES=nl run produced top_summaries with only `nl`
+    * keys. All 35 subscribers were English-default → previous
+    * sendByLanguage's "skip when bucket-lang missing" branch dropped
+    * the whole dispatch on the floor (`sent_count=0`). Combined with
+    * snelmind PR ensuring English is always in the clickbait language
+    * set, this is defense in depth — even if `en` is somehow missing
+    * upstream, the per-subscriber-bucket loop now tries to recover
+    * by routing un-keyed buckets through the English message. */
   private def sendByLanguage(
     client: ApnsMessagingService,
     frequency: Option[Int],
@@ -183,16 +201,34 @@ class NotificationService(
     val grouped = subscriptionRepository
       .findTokensByLanguageGrouped(environment, frequency)
       .getOrElse(Map.empty)
+    val englishFallback: Option[String] = messages.get("en")
     var totalSent   = 0
     var totalFailed = 0
-    messages.foreach { case (lang, title) =>
-      grouped.get(lang).filter(_.nonEmpty) match {
-        case None =>
-          logger.debug(s"dispatch: no subscribers for lang=$lang env=$environment freq=$frequency")
-        case Some(tokens) =>
-          val (sent, failed) = client.sendBatch(tokens, title, "")
-          totalSent   += sent
-          totalFailed += failed
+    grouped.foreach { case (subscriberLang, tokens) =>
+      if (tokens.isEmpty) {
+        // Empty bucket — skip without log noise.
+      } else {
+        val title: Option[String] = messages.get(subscriberLang).orElse(englishFallback)
+        title match {
+          case None =>
+            logger.warn(
+              s"dispatch: no message available for subscriberLang=$subscriberLang and no `en` fallback in " +
+                s"top_summary (keys=${messages.keys.toList.sorted.mkString(",")}); " +
+                s"${tokens.size} subscribers skipped env=$environment freq=$frequency"
+            )
+          case Some(t) =>
+            val isFallback = !messages.contains(subscriberLang)
+            if (isFallback) {
+              logger.info(
+                s"dispatch: english_fallback subscriberLang=$subscriberLang " +
+                  s"tokens=${tokens.size} env=$environment freq=$frequency " +
+                  s"top_summary_keys=${messages.keys.toList.sorted.mkString(",")}"
+              )
+            }
+            val (sent, failed) = client.sendBatch(tokens, t, "")
+            totalSent   += sent
+            totalFailed += failed
+        }
       }
     }
     (totalSent, totalFailed)
