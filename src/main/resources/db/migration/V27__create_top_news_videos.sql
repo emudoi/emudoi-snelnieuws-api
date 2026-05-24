@@ -1,9 +1,9 @@
--- top_news_videos was created here briefly (PR #18, 2026-05-24) and
--- dropped same-day in PR #19 — table ownership moved to ingestion-api.
--- File is kept verbatim so Flyway can match the applied history row in
--- prod (deleting it triggers "Detected applied migration not resolved
--- locally" on pod boot). V28 drops the table; on a fresh DB the
--- create→drop pair is a no-op.
+-- top_news_videos: work queue for the litikai-video-generator pipeline.
+-- Schema mirrored verbatim from litikai-video-generator's
+-- migrations/001_top_news_videos.sql so both repos can boot from a clean
+-- DB. Both sides use CREATE TABLE IF NOT EXISTS so whichever Flyway /
+-- bootstrap runs first wins, and the other becomes a no-op.
+
 CREATE TABLE IF NOT EXISTS top_news_videos (
     id              BIGSERIAL PRIMARY KEY,
 
