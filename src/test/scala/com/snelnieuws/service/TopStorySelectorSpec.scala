@@ -136,4 +136,78 @@ class TopStorySelectorSpec extends AnyWordSpec with Matchers {
       TopStorySelector.selectFromWindow(articles) shouldBe None
     }
   }
+
+  "selectTopN" should {
+
+    "return Nil for an empty window" in {
+      TopStorySelector.selectTopN(Nil, 5) shouldBe Nil
+    }
+
+    "return Nil for n=0 even on a non-empty window" in {
+      val articles = List(row(1, "x", author = "a.example", category = "politics"))
+      TopStorySelector.selectTopN(articles, 0) shouldBe Nil
+    }
+
+    "return up to N distinct picks in tier-priority order" in {
+      // 3 distinct URLs in a multi-publisher politics bucket (Tier 1 pick)
+      // + 3 single-publisher politics rows on different URLs (Tier 2/3
+      // fallbacks for the rest). Caller asks for 5 — should get 5.
+      val baseTs = OffsetDateTime.of(2026, 5, 24, 10, 0, 0, 0, ZoneOffset.UTC)
+      val multiPubBucket = List(
+        row(1, "Bucket-pol-A", author = "reuters.com",
+            url = "https://x.example/a", publishedAt = baseTs.plusMinutes(50)),
+        row(2, "Bucket-pol-B", author = "bbc.com",
+            url = "https://x.example/b", publishedAt = baseTs.plusMinutes(30)),
+        row(3, "Bucket-pol-C", author = "guardian.com",
+            url = "https://x.example/c", publishedAt = baseTs.plusMinutes(10))
+      )
+      val singlePubExtras = List(
+        row(4, "Solo-1", author = "solo.example", category = "business",
+            url = "https://x.example/s1", publishedAt = baseTs.minusHours(6)),
+        row(5, "Solo-2", author = "solo.example", category = "business",
+            url = "https://x.example/s2", publishedAt = baseTs.minusHours(7)),
+        row(6, "Solo-3", author = "solo.example", category = "business",
+            url = "https://x.example/s3", publishedAt = baseTs.minusHours(8))
+      )
+      val picks = TopStorySelector.selectTopN(multiPubBucket ++ singlePubExtras, 5)
+      picks should have length 5
+      // Each pick has a distinct representativeUrl.
+      picks.map(_.representativeUrl).toSet should have size 5
+      // First pick is Tier 1.
+      picks.head.tier shouldBe TopStorySelector.Tier1Heuristic
+    }
+
+    "return fewer than N when the window only has K viable picks" in {
+      // Single article → one pick max; even if N=5 we should get 1.
+      val articles = List(
+        row(42, "Trump signs bill", author = "ap.example", category = "politics")
+      )
+      val picks = TopStorySelector.selectTopN(articles, 5)
+      picks should have length 1
+      picks.head.representativeArticleId shouldBe 42
+    }
+
+    "tie-break by publishedAt DESC inside a multi-publisher bucket" in {
+      // Two distinct URLs in the same bucket, three publishers across them.
+      // After picking the freshest, the second iteration must pick the
+      // older one (publishedAt DESC ordering inside the bucket).
+      val baseTs = OffsetDateTime.of(2026, 5, 24, 10, 0, 0, 0, ZoneOffset.UTC)
+      val articles = List(
+        row(10, "A1", author = "p1.example",
+            url = "https://x.example/A", publishedAt = baseTs.plusMinutes(45)),
+        row(11, "A2", author = "p2.example",
+            url = "https://x.example/A", publishedAt = baseTs.plusMinutes(40)),
+        // Force the URL-multipub path on the *second* iteration by giving
+        // /B distinct publishers too.
+        row(20, "B1", author = "p3.example",
+            url = "https://x.example/B", publishedAt = baseTs.plusMinutes(15)),
+        row(21, "B2", author = "p1.example",
+            url = "https://x.example/B", publishedAt = baseTs.plusMinutes(5))
+      )
+      val picks = TopStorySelector.selectTopN(articles, 2)
+      picks should have length 2
+      picks.head.representativeUrl shouldBe "https://x.example/A"
+      picks(1).representativeUrl   shouldBe "https://x.example/B"
+    }
+  }
 }

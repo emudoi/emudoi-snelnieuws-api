@@ -12,7 +12,8 @@ import com.snelnieuws.api.{
   NewsServletV3,
   NotificationBroadcastServlet,
   NotificationDispatchServlet,
-  StaticContentServlet
+  StaticContentServlet,
+  VideoDispatchServlet
 }
 import com.snelnieuws.auth.FirebaseTokenVerifier
 import com.snelnieuws.db.Database
@@ -26,6 +27,7 @@ import com.snelnieuws.repository.{
   ImageCacheRepository,
   NotificationDispatchRepository,
   NotificationSubscriptionRepository,
+  TopNewsVideosRepository,
   TopSummaryRepository,
   UserRepository,
   UserSemanticQueryRepository
@@ -52,7 +54,8 @@ import com.snelnieuws.service.{
   PushyApnsMessagingService,
   SemanticQueryService,
   SummarizedArticleConsumer,
-  UserService
+  UserService,
+  VideoDispatchService
 }
 import com.typesafe.config.{Config, ConfigFactory}
 import doobie.hikari.HikariTransactor
@@ -91,6 +94,8 @@ class Components(
     new ImageCacheRepository(provideTransactor)
   lazy val featureFlagRepository: FeatureFlagRepository =
     new FeatureFlagRepository(provideTransactor)
+  lazy val topNewsVideosRepository: TopNewsVideosRepository =
+    new TopNewsVideosRepository(provideTransactor)
 
   // Image cache config — single source of truth read once on construct.
   private val imagesCfg = rootConfig.getConfig("images")
@@ -409,6 +414,10 @@ class Components(
     )
   lazy val androidNotificationDispatchServlet: AndroidNotificationDispatchServlet =
     new AndroidNotificationDispatchServlet(androidNotificationService, notificationsApiKey)
+  lazy val videoDispatchService: VideoDispatchService =
+    new VideoDispatchService(articleRepository, topNewsVideosRepository)
+  lazy val videoDispatchServlet: VideoDispatchServlet =
+    new VideoDispatchServlet(videoDispatchService, notificationsApiKey)
   lazy val androidNotificationBroadcastServlet: AndroidNotificationBroadcastServlet =
     new AndroidNotificationBroadcastServlet(androidNotificationService, notificationsApiKey)
   lazy val staticContentServlet: StaticContentServlet =

@@ -71,6 +71,44 @@ object TopStorySelector {
       .orElse(tier3PoliticsOrBusiness(articles, windowSize))
   }
 
+  /** Up to N distinct picks from the same window — feeds the
+    * "top 5 news of the day" video rundown. Each iteration removes
+    * the previously-picked URL from the window and re-runs the
+    * 3-tier heuristic, so picks come out in tier-priority order
+    * (Tier 1 first as long as multi-publisher buckets remain, then
+    * Tier 2's most-prolific-publisher fallback, then Tier 3's latest
+    * politics/business — same ordering as the single-pick path).
+    *
+    * Distinct = by URL. Two articles with the same URL but different
+    * languages would already be filtered out upstream (the caller
+    * passes a single-language window), but the URL-dedup also
+    * guards against the rare case where the same URL appears twice
+    * in a single-language window.
+    *
+    * Returns a (possibly empty) list — empty when the window has no
+    * viable Tier 3 fallback (e.g. sports-only with no author info).
+    */
+  def selectTopN(articles: List[ArticleV3Row], n: Int): List[Selection] = {
+    if (n <= 0 || articles.isEmpty) return Nil
+    val picks  = scala.collection.mutable.ListBuffer.empty[Selection]
+    val seen   = scala.collection.mutable.Set.empty[String]
+    var remaining = articles
+    while (picks.size < n && remaining.nonEmpty) {
+      selectFromWindow(remaining) match {
+        case None => return picks.toList
+        case Some(sel) if seen.contains(sel.representativeUrl) =>
+          // Defensive — selectFromWindow shouldn't re-pick a URL we
+          // already filtered out, but guard against an infinite loop.
+          return picks.toList
+        case Some(sel) =>
+          picks    += sel
+          seen     += sel.representativeUrl
+          remaining = remaining.filterNot(_.url == sel.representativeUrl)
+      }
+    }
+    picks.toList
+  }
+
   // ───────────────────────────── Tier 1 ─────────────────────────────
 
   /** Bucket articles by (category, country, 4h-published-window).
