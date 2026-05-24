@@ -45,6 +45,10 @@ class ScalatraBootstrap extends LifeCycle {
     // sandbox/production split so there is only one dispatch endpoint.
     context.mount(components.androidNotificationDispatchServlet, "/android/notifications/dispatch")
     context.mount(components.androidNotificationBroadcastServlet, "/android/notifications/broadcast")
+    // Video-script dispatch — Airflow (or any cron) POSTs here to enqueue
+    // a (v21, yellow) pair of video scripts for the litikai-video-generator
+    // pipeline. Same X-API-Key gate as the iOS/Android dispatch endpoints.
+    context.mount(components.videoDispatchServlet, "/api/videos/dispatch")
     context.mount(components.staticContentServlet, "/privacy")
     context.mount(components.staticContentServlet, "/support")
     context.mount(components.staticContentServlet, "/account-deletion")
