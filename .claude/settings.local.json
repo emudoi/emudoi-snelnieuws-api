@@ -76,7 +76,11 @@
       "Bash(python3 -c \"import json,sys; [print\\(e.get\\('name',''\\),'=', e.get\\('value','\\(secretRef\\)'\\)\\) for e in json.loads\\(sys.stdin.read\\(\\)\\)]\")",
       "Bash(codesign -d --entitlements - /Users/pranjutgogoi/Library/Developer/Xcode/DerivedData/SnelNieuws-dxyhlkfircjzkiavkzxtmvrjrsly/Build/Products/Debug-iphoneos/SnelNieuws.app)",
       "Bash(security cms *)",
-      "Bash(bash -n scripts/bootstrap-notification-secrets.sh)"
+      "Bash(bash -n scripts/bootstrap-notification-secrets.sh)",
+      "Bash(curl *)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('dags/snelnieuws_notifications_dag.py'\\).read\\(\\)\\); print\\('AST parse: ok'\\)\")",
+      "Bash(python3.9 -c \"import ast; ast.parse\\(open\\('dags/snelnieuws_notifications_dag.py'\\).read\\(\\)\\); print\\('3.9 parse: ok'\\)\")",
+      "Bash(python3 -c \"compile\\(open\\('dags/snelnieuws_notifications_dag.py'\\).read\\(\\), 'snelnieuws_notifications_dag.py', 'exec'\\); print\\('compile: ok'\\)\")"
     ]
   }
 }

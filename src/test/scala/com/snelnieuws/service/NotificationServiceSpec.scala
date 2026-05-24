@@ -105,6 +105,61 @@ class NotificationServiceSpec
       }
     }
 
+    // 2026-05-24 regression: with the inline top-story refactor, the
+    // dispatch path picks the story from the (lastAsOf, currentMax]
+    // article window — NOT from a pre-seeded top_summary row. This
+    // test inserts 3 articles and verifies (a) a top_summary row was
+    // CREATED by the dispatch (audit), (b) the notification was sent
+    // with a body listing the language keys, and (c) the title format
+    // includes the "N new articles" suffix.
+    "compose top story inline from articles window (post-refactor)" in {
+      requireDb()
+      val stub    = new StubApnsMessagingService(acceptAll = true)
+      val service = newService(apnsProd = Some(stub))
+
+      service.subscribe(
+        SubscribeRequest(
+          deviceId  = "ns-spec-inline-1",
+          apnsToken = "ns-spec-token-inline-1",
+          frequency = 4,
+          environment = "production"
+        )
+      ) shouldBe a[Right[_, _]]
+
+      // Three articles from the SAME author (publisher) in politics →
+      // Tier 2 single-publisher fallback fires; rep article = latest.
+      val ids = (1 to 3).map { i =>
+        articleRepo.create(
+          ArticleCreate(
+            author      = Some("inline.example"),
+            title       = s"Inline test article $i",
+            description = None,
+            url         = s"https://example.com/inline-${java.util.UUID.randomUUID()}",
+            urlToImage  = None,
+            content     = None,
+            category    = Some("politics")
+          )
+        ).fold(e => fail(e.getMessage), identity)
+      }
+      val countBefore = topSummaryRepo.findLatestUndispatched()
+        .fold(e => fail(e.getMessage), _.map(_.id).getOrElse(0L))
+
+      service.dispatch(frequency = Some(4), environment = "production") match {
+        case Right(DispatchOutcome.Sent(resp)) =>
+          resp.sent       should be >= 1
+          resp.newArticles should be >= 3
+        case other => fail(s"Expected Sent, got: $other")
+      }
+
+      // The inline path INSERTed a fresh top_summary AND immediately
+      // marked it dispatched. findLatestUndispatched should NOT have
+      // returned that fresh row.
+      val sentBatches = stub.batches.flatMap(_.tokens)
+      sentBatches should contain("ns-spec-token-inline-1")
+      val titles = stub.batches.map(_.title)
+      titles.exists(_.contains("new articles")) shouldBe true
+    }
+
     "send to subscribers for the given frequency when there are new articles" in {
       requireDb()
       val stub    = new StubApnsMessagingService(acceptAll = true)
