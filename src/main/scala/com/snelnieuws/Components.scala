@@ -52,7 +52,6 @@ import com.snelnieuws.service.{
   PushyApnsMessagingService,
   SemanticQueryService,
   SummarizedArticleConsumer,
-  TopStoryConsumer,
   UserService
 }
 import com.typesafe.config.{Config, ConfigFactory}
@@ -261,32 +260,14 @@ class Components(
       fcm = fcm
     )
 
-  // ── Top-stories Kafka consumer (notifications_clickbait_tasks.txt §8)
-  //
-  // Reuses the existing kafka.summarized-import bootstrap-servers /
-  // auto-offset-reset because the top-stories topic lives on the same
-  // cluster; the consumer-group is distinct so it tracks offsets
-  // independently.
-  lazy val topStoryConsumer: Option[TopStoryConsumer] =
-    if (slowRetryKafka.enabled) {
-      try Some(
-        new TopStoryConsumer(
-          topSummaryRepository = topSummaryRepository,
-          bootstrapServers     = slowRetryKafka.bootstrapServers,
-          topic                = rootConfig.getString("kafka.top-stories.topic"),
-          consumerGroup        = rootConfig.getString("kafka.top-stories.consumer-group"),
-          autoOffsetReset      = slowRetryKafka.autoOffsetReset
-        )
-      )
-      catch {
-        case e: Exception =>
-          logger.error(s"Failed to construct top-story consumer: ${e.getMessage}", e)
-          None
-      }
-    } else {
-      logger.info("top-story consumer is disabled (kafka.summarized-import.enabled=false)")
-      None
-    }
+  // 2026-05-24: top-stories Kafka consumer REMOVED. The inline
+  // top-story selection in NotificationService.dispatch +
+  // AndroidNotificationService.dispatch replaces the snelmind→
+  // ingestion-api→Kafka→TopStoryConsumer→top_summaries pipeline.
+  // top_summaries is still INSERTed (by the dispatch path itself,
+  // for audit), but never POPULATED from Kafka anymore. The
+  // `kafka.top-stories` config block in application.conf is dead
+  // weight and removed too.
 
   lazy val userService: UserService =
     new UserService(
@@ -444,7 +425,6 @@ class Components(
     imageCacheCleanupScheduler.foreach(_.start())
     summarizedArticleConsumer.foreach(_.start())
     imageRetrySlowConsumer.foreach(_.start())
-    topStoryConsumer.foreach(_.start())
   }
 
   def close(): Unit = {
@@ -456,7 +436,6 @@ class Components(
     // is stopped after the fast worker so any in-flight hand-offs
     // can land on the topic before the consumer's poll loop exits.
     summarizedArticleConsumer.foreach(_.stop())
-    topStoryConsumer.foreach(_.stop())
     imageDownloadWorker.stop()
     imageRetrySlowConsumer.foreach(_.stop())
     kafkaImageRetryProducer.close()

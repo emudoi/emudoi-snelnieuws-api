@@ -4,7 +4,8 @@ import com.snelnieuws.model.{
   BroadcastEnvResult,
   BroadcastResponse,
   DispatchResponse,
-  SubscribeRequest
+  SubscribeRequest,
+  TopStoryPayload
 }
 import com.snelnieuws.repository.{
   ArticleRepository,
@@ -13,6 +14,7 @@ import com.snelnieuws.repository.{
   NotificationSubscriptionRepository,
   TopSummaryRepository
 }
+import io.circe.Json
 import org.slf4j.LoggerFactory
 
 import java.time.OffsetDateTime
@@ -131,42 +133,133 @@ class NotificationService(
                             )
                             .map(_ => DispatchOutcome.Sent(DispatchResponse(0, 0, 0)))
                         } else {
-                          topSummaryRepository.findLatestUndispatched().flatMap {
-                            case None =>
-                              // §8 NoFreshTopStory branch. Do NOT
-                              // advance the pivot — the watcher will
-                              // retry on the next tick if/when a fresh
-                              // top story lands.
-                              logger.info(
-                                s"dispatch: no fresh top_summary; env=$environment freq=$frequency newArticles=$newArticles"
-                              )
-                              Right(DispatchOutcome.NoFreshTopStory)
-                            case Some(top) =>
-                              val (sent, failed) = sendByLanguage(
-                                c,
-                                frequency,
-                                environment,
-                                top.notificationMessages
-                              )
-                              for {
-                                _ <- topSummaryRepository.markDispatched(top.id, OffsetDateTime.now())
-                                _ <- dispatchRepository.recordDispatch(
-                                  frequency      = frequency,
-                                  environment    = environment,
-                                  asOfArticleId  = currentMax,
-                                  newArticles    = newArticles,
-                                  sent           = sent,
-                                  failed         = failed,
-                                  title          = s"top_summary=${top.id}",
-                                  body           = top.notificationMessages.keys.toList.sorted.mkString(","),
-                                  topSummaryId   = Some(top.id)
-                                )
-                              } yield DispatchOutcome.Sent(DispatchResponse(sent, failed, newArticles))
-                          }
+                          composeAndSendInline(
+                            client = c,
+                            frequency = frequency,
+                            environment = environment,
+                            lastAsOf = lastAsOf,
+                            currentMax = currentMax,
+                            newArticles = newArticles
+                          )
                         }
         } yield outcome
     }
   }
+
+  /** 2026-05-24 refactor: inline top-story SELECTION + DISPATCH.
+    *
+    * Replaces the pre-fix flow where `select_top_story_main` ran on
+    * the GPU (snelmind dstack) and published the top_summary via
+    * Kafka, which caused (a) spot-instance interruptions to produce
+    * duplicate top_summary rows, (b) the dispatch path to use stale
+    * top_summaries from hours-old snelmind runs, and (c) cost.
+    *
+    * New flow runs entirely in the dispatch request:
+    *   1. Load the (lastAsOf, currentMax] window of articles from
+    *      the same DB this service already uses — no remote calls,
+    *      no Milvus.
+    *   2. TopStorySelector.selectFromWindow → 3-tier heuristic pick.
+    *      None means "no viable top story in this window" → degrade
+    *      to NoFreshTopStory exactly like the old path did when
+    *      snelmind hadn't shipped anything fresh.
+    *   3. For each language present in `articles` rows of the picked
+    *      URL, take that row's localized title and append the
+    *      static "— N new articles" suffix from COUNT_PHRASES. No
+    *      LLM call. Subscribers whose language isn't in the
+    *      multi-language summary set just don't get this dispatch
+    *      (strict no-fallback per user direction).
+    *   4. INSERT a top_summary row for AUDIT (so we can still
+    *      reconstruct "which story was sent at 16:00 yesterday").
+    *      Marked dispatched_at immediately because we're sending NOW.
+    *   5. sendByLanguage + recordDispatch — unchanged.
+    *
+    * Failure modes:
+    *   - selector returns None → NoFreshTopStory + DON'T advance the
+    *     watermark (so the next watcher tick can retry; same as old).
+    *   - findTitlesByUrl returns empty → degrade to NoFreshTopStory.
+    *     Shouldn't happen since the rep URL was just queried, but
+    *     defensive.
+    */
+  private def composeAndSendInline(
+    client: ApnsMessagingService,
+    frequency: Option[Int],
+    environment: String,
+    lastAsOf: Option[Long],
+    currentMax: Option[Long],
+    newArticles: Int
+  ): Either[Throwable, DispatchOutcome] =
+    for {
+      window <- articleRepository.findInWindowForTopStory(lastAsOf, currentMax, "en")
+      outcome <- TopStorySelector.selectFromWindow(window) match {
+        case None =>
+          logger.info(
+            s"dispatch: no viable top story in window of ${window.size} articles; " +
+              s"env=$environment freq=$frequency newArticles=$newArticles"
+          )
+          Right(DispatchOutcome.NoFreshTopStory)
+        case Some(sel) =>
+          articleRepository.findTitlesByUrl(sel.representativeUrl).flatMap {
+            case empty if empty.isEmpty =>
+              logger.warn(
+                s"dispatch: rep article url=${sel.representativeUrl} has 0 title rows; " +
+                  s"degrading to NoFreshTopStory. env=$environment freq=$frequency"
+              )
+              Right(DispatchOutcome.NoFreshTopStory)
+            case titlesByLang =>
+              val notifMessages = composeNotificationMessages(titlesByLang, newArticles)
+              val payload = TopStoryPayload(
+                representativeArticleId = sel.representativeArticleId,
+                topNews                 = Json.obj(), // unused in the inline path
+                notificationMessages    = notifMessages,
+                selectionTier           = sel.tier.code,
+                selectionMetadata       = sel.selectionMetadata
+              )
+              for {
+                topId    <- topSummaryRepository.insert(payload)
+                _        <- topSummaryRepository.markDispatched(topId, OffsetDateTime.now())
+                (sent, failed) = sendByLanguage(client, frequency, environment, notifMessages)
+                _        <- dispatchRepository.recordDispatch(
+                              frequency      = frequency,
+                              environment    = environment,
+                              asOfArticleId  = currentMax,
+                              newArticles    = newArticles,
+                              sent           = sent,
+                              failed         = failed,
+                              title          = s"top_summary=$topId",
+                              body           = notifMessages.keys.toList.sorted.mkString(","),
+                              topSummaryId   = Some(topId)
+                            )
+              } yield DispatchOutcome.Sent(DispatchResponse(sent, failed, newArticles))
+          }
+      }
+    } yield outcome
+
+  /** Static per-language "{n} ... articles" suffix. Mirrors the
+    * Python COUNT_PHRASES dict from snelmind/agents/top_story.py —
+    * keeping them in sync is a manual chore but the set is small + rarely
+    * changes (7 ISO codes). */
+  private val CountPhrases: Map[String, String] = Map(
+    "en" -> "%d new articles",
+    "nl" -> "%d nieuwe artikelen",
+    "de" -> "%d neue Artikel",
+    "fr" -> "%d nouveaux articles",
+    "it" -> "%d nuovi articoli",
+    "es" -> "%d artículos nuevos",
+    "pl" -> "%d nowych artykułów"
+  )
+
+  /** Combine each language's localized title with its "— N new
+    * articles" suffix. Languages without a suffix template are
+    * skipped (defensive; not expected for the 7 supported codes). */
+  private def composeNotificationMessages(
+    titlesByLang: Map[String, String],
+    newArticles: Int
+  ): Map[String, String] =
+    titlesByLang.flatMap { case (lang, title) =>
+      CountPhrases.get(lang).map { suffixTmpl =>
+        lang -> s"$title — ${suffixTmpl.format(newArticles)}"
+      }
+    }
 
   /** Per-language fan-out. For each language present in the top
     * summary's notificationMessages map, look up the matching
