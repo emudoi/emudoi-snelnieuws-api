@@ -82,7 +82,7 @@ MAX_AUTO_TRIGGERS_PER_DAY = 4
 NEW_ARTICLES_THRESHOLD    = 5
 ACTIVE_WINDOW_START_HOUR  = 7
 ACTIVE_WINDOW_END_HOUR    = 19
-MIN_COOLDOWN_HOURS        = 2
+MIN_COOLDOWN_HOURS        = 3  # 2026-05-24: was 2; spreads MAX_AUTO_TRIGGERS_PER_DAY=4 across the 12h ACTIVE_WINDOW (07-19 Amsterdam) instead of clustering them in the first 8h
 AMSTERDAM = pendulum.timezone("Europe/Amsterdam")
 
 VAR_LAST_NOTIFIED_ARTICLE_ID = "snelnieuws_last_notified_article_id"
