@@ -43,3 +43,11 @@ spec:
         value: emudoi-snelnieuws-api
       - name: service-account
         value: emudoi-snelnieuws-api
+      # Cross-namespace shared API key: snelnieuws-api → ingestion-api's
+      # internal /api/internal/search/semantic endpoint. Same secret is read
+      # by ingestion-api itself (the producer side); both sides must list it
+      # here or the provision-vault step regenerates a policy without it and
+      # the vault-agent sidecar crash-loops.
+      - name: extra-vault-paths
+        value: |
+          ingestion-api/semantic-search-key
