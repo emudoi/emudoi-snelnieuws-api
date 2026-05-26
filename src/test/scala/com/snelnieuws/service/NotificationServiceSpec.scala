@@ -6,6 +6,7 @@ import com.snelnieuws.model.{ArticleCreate, SubscribeRequest}
 import com.snelnieuws.repository.{
   ArticleRepository,
   FeatureFlagRepository,
+  NotificationCandidateRepository,
   NotificationDispatchRepository,
   NotificationSubscriptionRepository
 }
@@ -22,11 +23,12 @@ class NotificationServiceSpec
   private lazy val dispatchRepo     = new NotificationDispatchRepository(Database.transactor)
   private lazy val flagRepo         = new FeatureFlagRepository(Database.transactor)
   private lazy val topSummaryRepo   = new com.snelnieuws.repository.TopSummaryRepository(Database.transactor)
+  private lazy val candidateRepo    = new NotificationCandidateRepository(Database.transactor)
 
   private def newService(apnsProd: Option[ApnsMessagingService] = None,
                          apnsSandbox: Option[ApnsMessagingService] = None) =
     new NotificationService(articleRepo, subRepo, dispatchRepo, flagRepo, topSummaryRepo,
-      apnsProd = apnsProd, apnsSandbox = apnsSandbox)
+      candidateRepo, apnsProd = apnsProd, apnsSandbox = apnsSandbox)
 
   /** Seed an undispatched top_summary so dispatch() finds work to do.
     * Required by every test that exercises the post-§8 dispatch path
@@ -221,6 +223,57 @@ class NotificationServiceSpec
           fail(s"Expected Sent, got: $other")
       }
       stub.batches shouldBe empty
+    }
+
+    // V29 fallback-pool path. Flips the feature flag on, exercises the
+    // per-language pool flow, and verifies that the dispatch sends a
+    // notification. The legacy flag-off path remains covered by the
+    // surrounding tests. `try/finally` keeps the flag clean even on
+    // assertion failure so downstream tests don't accidentally run on
+    // the pool path.
+    "dispatch via fallback pool when notifications_fallback_pool_enabled is on" in {
+      requireDb()
+      val stub    = new StubApnsMessagingService(acceptAll = true)
+      val service = newService(apnsProd = Some(stub))
+
+      flagRepo.setEnabled(FallbackPoolConfig.FlagName, true) shouldBe a[Right[_, _]]
+      try {
+        // frequency must be BETWEEN 1 AND 4 (V4 CHECK constraint).
+        service.subscribe(
+          SubscribeRequest(
+            deviceId    = "ns-spec-pool-1",
+            apnsToken   = "ns-spec-token-pool-1",
+            frequency   = 4,
+            environment = "production"
+          )
+        ) shouldBe a[Right[_, _]]
+
+        val uniqueTag = java.util.UUID.randomUUID().toString.take(8)
+        (1 to 5).foreach { i =>
+          articleRepo.create(
+            ArticleCreate(
+              author      = Some(s"pool-pub-$i.example"),
+              title       = s"Pool test article $uniqueTag-$i",
+              description = None,
+              url         = s"https://example.com/pool-$uniqueTag-$i",
+              urlToImage  = None,
+              content     = None,
+              category    = Some("politics")
+            )
+          ) shouldBe a[Right[_, _]]
+        }
+
+        service.dispatch(frequency = Some(4), environment = "production") match {
+          case Right(DispatchOutcome.Sent(resp)) =>
+            resp.sent should be >= 1
+            resp.newArticles should be >= 5
+          case other => fail(s"Expected Sent under pool flag, got: $other")
+        }
+
+        stub.batches.flatMap(_.tokens) should contain("ns-spec-token-pool-1")
+      } finally {
+        flagRepo.setEnabled(FallbackPoolConfig.FlagName, false)
+      }
     }
 
     "route sandbox dispatches to the sandbox client and skip production tokens" in {

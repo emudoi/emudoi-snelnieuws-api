@@ -136,4 +136,112 @@ class TopStorySelectorSpec extends AnyWordSpec with Matchers {
       TopStorySelector.selectFromWindow(articles) shouldBe None
     }
   }
+
+  "selectTopN" should {
+
+    "return an empty Seq for an empty window or non-positive n" in {
+      TopStorySelector.selectTopN(Nil, 4)             shouldBe empty
+      TopStorySelector.selectTopN(List(row(1)), 0)    shouldBe empty
+      TopStorySelector.selectTopN(List(row(1)), -1)   shouldBe empty
+    }
+
+    "return up to n distinct-URL selections in best-first tier order" in {
+      val baseTs = OffsetDateTime.of(2026, 5, 24, 10, 0, 0, 0, ZoneOffset.UTC)
+      // Tier 1 cluster (3 publishers, politics/nl/10:xx bucket)
+      val tier1Cluster = List(
+        row(1, "Trump Beijing",  author = "reuters.com",     publishedAt = baseTs),
+        row(2, "Trump-Xi summit", author = "bbc.com",        publishedAt = baseTs.plusMinutes(30)),
+        row(3, "Xi-Trump meets",  author = "theguardian.com", publishedAt = baseTs.plusMinutes(45))
+      )
+      // Tier 2 single-publisher run (3 entertainment articles from one publisher)
+      val tier2SinglePub = (4L to 6L).toList.map { i =>
+        row(i, s"Music news $i", author = "musicfeed.example",
+            category = "entertainment", publishedAt = baseTs.plusHours(2).plusMinutes(i))
+      }
+      // Lone politics article in a different bucket. Tier 2's
+      // single-publisher pick catches it first (URL dedup wins over the
+      // Tier 3 candidate) — that's the design.
+      val lonePolitics = row(7, "Budget passed", author = "lone.example",
+        category = "politics", country = "de",
+        publishedAt = baseTs.plusHours(6))
+
+      val top4 = TopStorySelector.selectTopN(tier1Cluster ++ tier2SinglePub :+ lonePolitics, 4)
+
+      // Distinct URLs.
+      top4.map(_.representativeUrl).distinct.size shouldBe top4.size
+
+      // First pick must be Tier 1 (highest publisher count).
+      top4.headOption.map(_.tier) shouldBe Some(TopStorySelector.Tier1Heuristic)
+
+      // The lone politics article must surface in the pool (URL-deduped
+      // — Tier 2 single_publisher picks it before Tier 3 sees it).
+      top4.exists(_.representativeArticleId == 7) shouldBe true
+
+      // At most n.
+      top4.size should be <= 4
+    }
+
+    "fill with Tier 4 last-resort when strict tiers can't reach n" in {
+      // One politics article from a unique publisher (Tier 3 fires
+      // once; Tier 2 single-publisher fallback also fires once but on
+      // the same URL, so dedup collapses them). Strict tiers produce
+      // 1 candidate; ask for 4 → 3 Tier 4 fillers needed but only 0
+      // other articles exist, so we get exactly 1 pick total.
+      val articles = List(
+        row(1, "Lone politics", author = "lone.example", category = "politics")
+      )
+      val picks = TopStorySelector.selectTopN(articles, 4)
+      picks.size shouldBe 1
+      picks.head.tier should (be(TopStorySelector.Tier3PoliticsOrBusiness) or
+        be(TopStorySelector.Tier2SinglePublisher))
+    }
+
+    "produce a 3-strong pool from sports/entertainment without Tier 4" in {
+      // Three sports articles from three different publishers in the
+      // same (sports, nl, 10:00) bucket → Tier 1 fires once with
+      // 3 distinct publishers, then Tier 2's single-publisher branch
+      // contributes one entry per publisher (deduped by URL against
+      // Tier 1's rep). Net: 1 Tier 1 pick + 2 distinct-URL Tier 2
+      // picks = 3 total. No Tier 4 needed.
+      val articles = List(
+        row(1, "Sport A", author = "espn.example",   category = "sports"),
+        row(2, "Sport B", author = "skysports.example", category = "sports"),
+        row(3, "Sport C", author = "fox.example",    category = "sports")
+      )
+      val picks = TopStorySelector.selectTopN(articles, 4)
+      picks.size shouldBe 3
+      picks.head.tier shouldBe TopStorySelector.Tier1Heuristic
+      picks.tail.foreach(p => p.tier shouldBe TopStorySelector.Tier2SinglePublisher)
+    }
+
+    "use Tier 4 when articles have NO authors and NO politics/business" in {
+      // No tier should fire on this window — author=None disables
+      // Tier 1 (need ≥2 publishers) AND Tier 2 (fallback needs at
+      // least one author), category=sports disables Tier 3. The new
+      // Tier 4 last-resort fills the pool from latest-first articles.
+      // Stagger publishedAt so the "newest first" ordering is testable
+      // without relying on tie-break behaviour for equal timestamps.
+      val baseTs = OffsetDateTime.of(2026, 5, 24, 10, 0, 0, 0, ZoneOffset.UTC)
+      val articles = (1L to 3L).toList.map { i =>
+        row(i, s"Title $i", author = "", category = "sports",
+            publishedAt = baseTs.plusMinutes(i * 10)).copy(author = None)
+      }
+      val picks = TopStorySelector.selectTopN(articles, 4)
+      picks.size shouldBe 3
+      picks.foreach(_.tier shouldBe TopStorySelector.Tier4LastResort)
+      // Latest first → newest id (3) wins, then 2, then 1.
+      picks.head.representativeArticleId shouldBe 3
+    }
+
+    "preserve `selectFromWindow` behaviour exactly (no Tier 4 emitted)" in {
+      // Pure sports/entertainment, no authors → selectFromWindow MUST
+      // still return None even though selectTopN now produces Tier 4
+      // picks for the same window.
+      val articles = (1L to 3L).toList.map { i =>
+        row(i, s"Title $i", author = "", category = "sports").copy(author = None)
+      }
+      TopStorySelector.selectFromWindow(articles) shouldBe None
+      TopStorySelector.selectTopN(articles, 4)    should not be empty
+    }
+  }
 }

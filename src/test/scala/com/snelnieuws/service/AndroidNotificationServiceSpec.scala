@@ -7,7 +7,8 @@ import com.snelnieuws.repository.{
   AndroidNotificationDispatchRepository,
   AndroidNotificationSubscriptionRepository,
   ArticleRepository,
-  FeatureFlagRepository
+  FeatureFlagRepository,
+  NotificationCandidateRepository
 }
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.wordspec.AnyWordSpec
@@ -22,9 +23,11 @@ class AndroidNotificationServiceSpec
   private lazy val dispatchRepo   = new AndroidNotificationDispatchRepository(Database.transactor)
   private lazy val flagRepo       = new FeatureFlagRepository(Database.transactor)
   private lazy val topSummaryRepo = new com.snelnieuws.repository.TopSummaryRepository(Database.transactor)
+  private lazy val candidateRepo  = new NotificationCandidateRepository(Database.transactor)
 
   private def newService(fcm: Option[FcmMessagingService] = None) =
-    new AndroidNotificationService(articleRepo, subRepo, dispatchRepo, flagRepo, topSummaryRepo, fcm = fcm)
+    new AndroidNotificationService(articleRepo, subRepo, dispatchRepo, flagRepo, topSummaryRepo,
+      candidateRepo, fcm = fcm)
 
   /** Seed an undispatched top_summary so dispatch() finds work to do.
     * Mirrors the helper in NotificationServiceSpec — see that file

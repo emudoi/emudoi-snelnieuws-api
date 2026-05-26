@@ -24,6 +24,7 @@ import com.snelnieuws.repository.{
   ArticleRepository,
   FeatureFlagRepository,
   ImageCacheRepository,
+  NotificationCandidateRepository,
   NotificationDispatchRepository,
   NotificationSubscriptionRepository,
   TopSummaryRepository,
@@ -239,6 +240,13 @@ class Components(
   lazy val topSummaryRepository: TopSummaryRepository =
     new TopSummaryRepository(provideTransactor)
 
+  // ── V29 fallback-pool storage. Shared across iOS + Android since
+  //    the table itself is platform-agnostic; each service writes its
+  //    own per-language pool independently (rows are keyed by run_id
+  //    + language, so the two services never collide).
+  lazy val notificationCandidateRepository: NotificationCandidateRepository =
+    new NotificationCandidateRepository(provideTransactor)
+
   lazy val notificationService: NotificationService =
     new NotificationService(
       articleRepository,
@@ -246,6 +254,7 @@ class Components(
       notificationDispatchRepository,
       featureFlagRepository,
       topSummaryRepository,
+      notificationCandidateRepository,
       apnsProd    = apns,
       apnsSandbox = apnsSandbox
     )
@@ -257,6 +266,7 @@ class Components(
       androidNotificationDispatchRepository,
       featureFlagRepository,
       topSummaryRepository,
+      notificationCandidateRepository,
       fcm = fcm
     )
 
