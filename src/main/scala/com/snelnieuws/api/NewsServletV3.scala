@@ -1,7 +1,7 @@
 package com.snelnieuws.api
 
 import com.snelnieuws.auth.FirebaseTokenVerifier
-import com.snelnieuws.model.{ArticleV3Row, Categories, CategoryNames, EmbedQueryRequest, Languages}
+import com.snelnieuws.model.{ArticleV3Row, Categories, CategoryNames, EmbedQueryRequest, Languages, UiStrings}
 import com.snelnieuws.repository.AppClientRepository
 import com.snelnieuws.model.ArticleV3Row
 import com.snelnieuws.service.{ArticleService, IngestionApiClient, IngestionApiError, NotificationService, SemanticQueryService, UserService}
@@ -241,6 +241,25 @@ class NewsServletV3(
     resolveLanguage() match {
       case Right(locale) =>
         Map("languages" -> Languages.forLocale(locale))
+      case Left(msg) =>
+        BadRequest(Map("error" -> msg))
+    }
+  }
+
+  // ──────────────────────────────── i18n ─────────────────────────────────
+  //
+  // Backend-driven UI translation bundle for the iOS + Android clients.
+  // Same locale-resolution + fallback semantics as /categories and
+  // /languages: unknown but well-formed locales fall back to the
+  // English row; malformed locales 400. Apps fetch on startup + on
+  // language switch, cache the response, and look up strings via their
+  // L10n helper. Adding a language tomorrow = extend UiStrings.scala +
+  // redeploy; no app release needed.
+
+  get("/i18n") {
+    resolveLanguage() match {
+      case Right(locale) =>
+        Map("strings" -> UiStrings.forLocale(locale))
       case Left(msg) =>
         BadRequest(Map("error" -> msg))
     }

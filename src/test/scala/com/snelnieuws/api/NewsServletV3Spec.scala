@@ -517,6 +517,54 @@ class NewsServletV3Spec
     }
   }
 
+  "GET /v3/i18n" should {
+    "return the English UI bundle by default" in {
+      requireDb()
+      get("/v3/i18n", Map.empty[String, String], gatedHeaders) {
+        status shouldBe 200
+        val parsed = org.json4s.jackson.parseJson(body)
+        val strings = parsed \ "strings"
+        (strings \ "common.continue").extract[String] shouldBe "Continue"
+        (strings \ "onboarding.lang.title").extract[String] shouldBe "Pick your language"
+        (strings \ "settings.title").extract[String] shouldBe "Settings"
+      }
+    }
+
+    "render the Dutch bundle when ?language=nl" in {
+      requireDb()
+      get("/v3/i18n", Map("language" -> "nl"), gatedHeaders) {
+        status shouldBe 200
+        val strings = org.json4s.jackson.parseJson(body) \ "strings"
+        (strings \ "common.continue").extract[String] shouldBe "Doorgaan"
+        (strings \ "onboarding.lang.title").extract[String] shouldBe "Kies je taal"
+        (strings \ "settings.title").extract[String] shouldBe "Instellingen"
+      }
+    }
+
+    "fall back to English on an unsupported well-formed locale" in {
+      requireDb()
+      get("/v3/i18n", Map("language" -> "ja"), gatedHeaders) {
+        status shouldBe 200
+        val strings = org.json4s.jackson.parseJson(body) \ "strings"
+        (strings \ "common.continue").extract[String] shouldBe "Continue"
+      }
+    }
+
+    "400 on a malformed locale" in {
+      requireDb()
+      get("/v3/i18n", Map("language" -> "XYZ"), gatedHeaders) {
+        status shouldBe 400
+      }
+    }
+
+    "403 without X-Client (auth gate applies)" in {
+      requireDb()
+      get("/v3/i18n", Map.empty[String, String], Map.empty[String, String]) {
+        status shouldBe 403
+      }
+    }
+  }
+
   "GET /v3/feed language filter" should {
     "default to English when no ?language= and no Accept-Language" in {
       requireDb()
