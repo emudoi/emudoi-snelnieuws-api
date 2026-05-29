@@ -137,18 +137,14 @@ class AndroidNotificationServiceSpec
       stub.batches.flatMap(_.tokens) should contain("and-spec-token-2")
     }
 
-    "return Sent with newArticles=0 immediately after a previous dispatch with no inserts" in {
+    "return NoFreshTopStory when no new articles and the pool path is off" in {
       requireDb()
       val stub    = new StubFcmMessagingService(acceptAll = true)
       val service = newService(Some(stub))
 
       service.dispatch(frequency = Some(2)) match {
-        case Right(DispatchOutcome.Sent(resp)) =>
-          resp.newArticles shouldBe 0
-          resp.sent shouldBe 0
-          resp.failed shouldBe 0
-        case other =>
-          fail(s"Expected Sent, got: $other")
+        case Right(DispatchOutcome.NoFreshTopStory) => succeed
+        case other => fail(s"Expected NoFreshTopStory, got: $other")
       }
       stub.batches shouldBe empty
     }
@@ -184,9 +180,8 @@ class AndroidNotificationServiceSpec
 
       // §8 needs a fresh top_summary for each dispatch that expects Sent
       // with non-zero counts — without one, dispatch returns
-      // NoFreshTopStory. seedTopSummary is called twice so the second
-      // dispatch (which expects newArticles=0) goes through the early-
-      // return Sent(0,0,0) branch and doesn't need its own seed.
+      // NoFreshTopStory. Only seed for the first dispatch; the second
+      // has no fresh articles so the legacy path returns NoFreshTopStory.
       seedTopSummary()
 
       service.dispatch(frequency = Some(1)) match {
@@ -194,10 +189,11 @@ class AndroidNotificationServiceSpec
         case other                              => fail(s"Expected Sent, got: $other")
       }
 
-      // No new articles → 0 (early-return path in §8 — no top_summary needed).
+      // No new articles + pool flag off → NoFreshTopStory (legacy path
+      // window is empty so the selector returns None).
       service.dispatch(frequency = Some(1)) match {
-        case Right(DispatchOutcome.Sent(resp)) => resp.newArticles shouldBe 0
-        case other                              => fail(s"Expected Sent, got: $other")
+        case Right(DispatchOutcome.NoFreshTopStory) => succeed
+        case other => fail(s"Expected NoFreshTopStory, got: $other")
       }
     }
   }

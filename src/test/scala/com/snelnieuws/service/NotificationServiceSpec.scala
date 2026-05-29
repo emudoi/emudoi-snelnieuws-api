@@ -206,21 +206,17 @@ class NotificationServiceSpec
       stub.batches.flatMap(_.tokens) should contain("ns-spec-token-2")
     }
 
-    "return Sent with newArticles=0 immediately after a previous dispatch with no inserts" in {
+    "return NoFreshTopStory when no new articles and the pool path is off" in {
       requireDb()
       val stub    = new StubApnsMessagingService(acceptAll = true)
       val service = newService(apnsProd = Some(stub))
 
       // Frequency=2 was just dispatched in the previous test — no fresh inserts here.
-      // newArticles==0 is the early-return path that bypasses the new top_summary
-      // lookup entirely (§8 keeps the no-op Sent(0,0,0) branch unchanged).
+      // Legacy path: empty (lastAsOf, currentMax] window → selector None →
+      // NoFreshTopStory. Pool path off, so no older candidate to drain.
       service.dispatch(frequency = Some(2), environment = "production") match {
-        case Right(DispatchOutcome.Sent(resp)) =>
-          resp.newArticles shouldBe 0
-          resp.sent shouldBe 0
-          resp.failed shouldBe 0
-        case other =>
-          fail(s"Expected Sent, got: $other")
+        case Right(DispatchOutcome.NoFreshTopStory) => succeed
+        case other => fail(s"Expected NoFreshTopStory, got: $other")
       }
       stub.batches shouldBe empty
     }

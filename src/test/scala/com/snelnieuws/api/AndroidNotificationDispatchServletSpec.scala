@@ -63,29 +63,22 @@ class AndroidNotificationDispatchServletSpec
       }
     }
 
-    "return 200 with a valid X-API-Key (no subscribers, no articles)" in {
+    "return 200 with a valid X-API-Key (no Android subscribers in this spec)" in {
       requireDb()
-      // §8 dispatch flow requires a fresh top_summary when newArticles>0
-      // OR returns Sent(0,0,0) when newArticles==0. Earlier suites in
-      // the same DB may have inserted articles, so seed one
-      // defensively — the per-language fan-out finds no Android
-      // subscribers and returns sent=0 either way.
-      val seedPayload = com.snelnieuws.model.TopStoryPayload(
-        representativeArticleId = scala.util.Random.nextLong().abs,
-        topNews                 = io.circe.Json.obj(),
-        notificationMessages    = Map("en" -> "android dispatch-spec headline"),
-        selectionTier           = 1,
-        selectionMetadata       = io.circe.Json.obj()
-      )
-      components.topSummaryRepository.insert(seedPayload) shouldBe a[Right[_, _]]
-
+      // Earlier suites in the shared DB inserted articles, so the
+      // (lastAsOf, currentMax] window is non-empty and the inline
+      // selector finds a top story. With no Android subscribers in
+      // this spec, the fan-out returns sent=0 → 200. If the window
+      // happens to be empty (Android service spec advanced lastAsOf
+      // up to currentMax), the new path returns 503 NoFreshTopStory.
       post(
         "/android/notifications/dispatch",
         Map.empty[String, String],
         Map("X-API-Key" -> testApiKey)
       ) {
-        status shouldBe 200
-        body should include("sent")
+        status should (be(200) or be(503))
+        if (status == 200) body should include("sent")
+        else body should include("no_fresh_top_story")
       }
     }
 

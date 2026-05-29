@@ -600,22 +600,21 @@ class NewsServletSpec
       batches.flatMap(_.tokens) should contain("dispatch-token-1")
     }
 
-    "return sent=0 / failed=0 when there are no new articles since last dispatch" in {
+    "return 503 no_fresh_top_story when there are no new articles since last dispatch" in {
       requireDb()
-      // The previous test's recordDispatch makes lastAsOfArticleId equal to the
-      // current latest, so newArticles is 0 here unless someone else inserted.
+      // The previous test's recordDispatch makes lastAsOfArticleId equal
+      // to the current latest, so newArticles is 0 here. With the early
+      // return gone and the pool flag off, the legacy path's empty
+      // window short-circuits to NoFreshTopStory → 503.
       stubApns.clear()
       post(
         "/notifications/dispatch?frequency=4",
         "",
         jsonHeader ++ Map("X-API-Key" -> testApiKey)
       ) {
-        status shouldBe 200
-        val parsed = org.json4s.jackson.parseJson(body)
-        (parsed \ "sent").extract[Int] shouldBe 0
-        (parsed \ "failed").extract[Int] shouldBe 0
+        status shouldBe 503
+        body should include("no_fresh_top_story")
       }
-      // No tokens means no batches recorded.
       stubApns.batches shouldBe empty
     }
   }

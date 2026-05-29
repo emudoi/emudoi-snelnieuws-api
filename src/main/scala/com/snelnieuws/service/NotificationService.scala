@@ -139,32 +139,14 @@ class NotificationService(
           lastAsOf    <- dispatchRepository.findLastAsOfArticleId(frequency, environment)
           newArticles <- articleRepository.countSinceId(lastAsOf)
           currentMax  <- articleRepository.latestId()
-          outcome     <- if (newArticles == 0) {
-                          // No new articles → no fire, but record the
-                          // no-op for audit. Unchanged from legacy behavior.
-                          dispatchRepository
-                            .recordDispatch(
-                              frequency = frequency,
-                              environment = environment,
-                              asOfArticleId = currentMax,
-                              newArticles = 0,
-                              sent = 0,
-                              failed = 0,
-                              title = "",
-                              body = "",
-                              topSummaryId = None
-                            )
-                            .map(_ => DispatchOutcome.Sent(DispatchResponse(0, 0, 0)))
-                        } else {
-                          composeAndSendInline(
-                            client = c,
-                            frequency = frequency,
-                            environment = environment,
-                            lastAsOf = lastAsOf,
-                            currentMax = currentMax,
-                            newArticles = newArticles
-                          )
-                        }
+          outcome     <- composeAndSendInline(
+                          client = c,
+                          frequency = frequency,
+                          environment = environment,
+                          lastAsOf = lastAsOf,
+                          currentMax = currentMax,
+                          newArticles = newArticles
+                        )
         } yield outcome
     }
   }
@@ -466,7 +448,8 @@ class NotificationService(
   ): Either[Throwable, DispatchOutcome] = {
     val notifMessages: Map[String, String] = picksByLanguage.flatMap {
       case (lang, pick) =>
-        CountPhrases.get(lang).map { suffixTmpl =>
+        if (newArticles <= 0) Some(lang -> pick.title)
+        else CountPhrases.get(lang).map { suffixTmpl =>
           lang -> s"${pick.title} — ${suffixTmpl.format(newArticles)}"
         }
     }
@@ -560,7 +543,8 @@ class NotificationService(
     newArticles: Int
   ): Map[String, String] =
     titlesByLang.flatMap { case (lang, title) =>
-      CountPhrases.get(lang).map { suffixTmpl =>
+      if (newArticles <= 0) Some(lang -> title)
+      else CountPhrases.get(lang).map { suffixTmpl =>
         lang -> s"$title — ${suffixTmpl.format(newArticles)}"
       }
     }

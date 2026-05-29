@@ -93,28 +93,13 @@ class AndroidNotificationService(
           lastAsOf    <- dispatchRepository.findLastAsOfArticleId(frequency)
           newArticles <- articleRepository.countSinceId(lastAsOf)
           currentMax  <- articleRepository.latestId()
-          outcome     <- if (newArticles == 0) {
-                          dispatchRepository
-                            .recordDispatch(
-                              frequency = frequency,
-                              asOfArticleId = currentMax,
-                              newArticles = 0,
-                              sent = 0,
-                              failed = 0,
-                              title = "",
-                              body = "",
-                              topSummaryId = None
-                            )
-                            .map(_ => DispatchOutcome.Sent(DispatchResponse(0, 0, 0)))
-                        } else {
-                          composeAndSendInline(
-                            client = client,
-                            frequency = frequency,
-                            lastAsOf = lastAsOf,
-                            currentMax = currentMax,
-                            newArticles = newArticles
-                          )
-                        }
+          outcome     <- composeAndSendInline(
+                          client = client,
+                          frequency = frequency,
+                          lastAsOf = lastAsOf,
+                          currentMax = currentMax,
+                          newArticles = newArticles
+                        )
         } yield outcome
     }
 
@@ -332,7 +317,8 @@ class AndroidNotificationService(
   ): Either[Throwable, DispatchOutcome] = {
     val notifMessages: Map[String, String] = picksByLanguage.flatMap {
       case (lang, pick) =>
-        CountPhrases.get(lang).map { suffixTmpl =>
+        if (newArticles <= 0) Some(lang -> pick.title)
+        else CountPhrases.get(lang).map { suffixTmpl =>
           lang -> s"${pick.title} — ${suffixTmpl.format(newArticles)}"
         }
     }
@@ -414,7 +400,8 @@ class AndroidNotificationService(
     newArticles: Int
   ): Map[String, String] =
     titlesByLang.flatMap { case (lang, title) =>
-      CountPhrases.get(lang).map { suffixTmpl =>
+      if (newArticles <= 0) Some(lang -> title)
+      else CountPhrases.get(lang).map { suffixTmpl =>
         lang -> s"$title — ${suffixTmpl.format(newArticles)}"
       }
     }
