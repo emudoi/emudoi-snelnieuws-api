@@ -1,3 +1,3 @@
 kustomize:
   images:
-  - ghcr.io/emudoi/emudoi-snelnieuws-api:main@sha256:0cc4b153a2dc3c4494427e7def9c6d81fda88ab65fcb8348c833b924ced57b43
+  - ghcr.io/emudoi/emudoi-snelnieuws-api:main@sha256:480bd9f20101f93c3908bb9269fb273a816624a0a267f593a4178fcb607d23f2
