@@ -282,105 +282,40 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         Left(e)
     }
 
-  /** Count articles whose id is greater than `sinceId`. When `sinceId` is None
-   *  (no prior dispatch), counts all articles in the table.
-   */
-  def countSinceId(sinceId: Option[Long]): Either[Throwable, Int] =
-    try {
-      val q = sinceId match {
-        case Some(id) => sql"SELECT COUNT(*) FROM articles WHERE id > $id"
-        case None     => sql"SELECT COUNT(*) FROM articles"
-      }
-      Right(q.query[Int].unique.transact(transactor).unsafeRunSync())
-    } catch {
-      case e: Exception =>
-        logger.error(s"Failed to count articles since=$sinceId: ${e.getMessage}", e)
-        Left(e)
-    }
-
-  /** Articles in the (sinceId, upToId] window for top-story selection.
-    * Filtered to a single language (in practice 'en') so the publisher-
-    * counting math inside the selector isn't muddled by per-language
-    * summary rows of the same source article.
+  /** Articles for one language published on or after `since`, for
+    * top-story selection. Replaces the old global `(lastAsOf,
+    * currentMax]` id-window: each language now selects from its OWN
+    * recent articles, so a high-volume language can't push a shared
+    * watermark past a slower language's fresh articles (per-language
+    * pool fairness).
     *
     * Returns the full ArticleV3Row shape so the selector can use
     * `author` (= publisher domain), `category`, `country`,
-    * `publishedAt`, `url` without a second query.
-    *
-    * NOTE on `is_local`: the column is computed against a country here
-    * (just to match the shared ArticleV3Row shape); the selector
-    * ignores it. We pass the empty string for `country` so
-    * `country = '' OR '' = ANY(shared_countries)` never matches → all
-    * rows get is_local=false. Cheaper than ALTER-ing the row case
-    * class to make is_local optional. */
-  def findInWindowForTopStory(
-    sinceId: Option[Long],
-    upToId: Option[Long],
-    language: String
+    * `publishedAt`, `url` without a second query. is_local is forced
+    * false (empty country placeholder) — the selector ignores it. */
+  def findRecentForTopStory(
+    language: String,
+    since: OffsetDateTime
   ): Either[Throwable, List[ArticleV3Row]] =
     try {
-      val country = "" // placeholder — see method comment
-      val rangeFilter: Fragment = sinceId match {
-        case Some(s) => fr"AND id > $s"
-        case None    => Fragment.empty
-      }
-      val upperFilter: Fragment = upToId match {
-        case Some(u) => fr"AND id <= $u"
-        case None    => Fragment.empty
-      }
-      val baseSelect = fr"""
+      val country = "" // placeholder — selector ignores is_local
+      val q = fr"""
         SELECT id, author, title, description, url, url_to_image,
                published_at, content, category, country,
                COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
                language
         FROM articles
         WHERE language = $language
+          AND published_at >= $since
+        ORDER BY id ASC
       """
-      val q = baseSelect ++ rangeFilter ++ upperFilter ++ fr"ORDER BY id ASC"
       Right(q.query[ArticleV3Row].to[List].transact(transactor).unsafeRunSync())
     } catch {
       case e: Exception =>
         logger.error(
-          s"Failed to load window for top-story since=$sinceId upTo=$upToId lang=$language: ${e.getMessage}",
+          s"Failed to load recent window for top-story lang=$language since=$since: ${e.getMessage}",
           e
         )
-        Left(e)
-    }
-
-  /** Look up the localized title of every snelmind-summarized
-    * language version of a given URL. Used by the inline dispatch
-    * flow to compose `notification_messages = {lang: title}` from the
-    * snelnieuws-side articles table alone (the rep URL is the same
-    * across language rows because the upsert key is `url`-derived).
-    *
-    * Returns Map[language, title]. Empty map = no rows for that URL
-    * (shouldn't happen since the rep article we picked HAS rows).
-    */
-  def findTitlesByUrl(url: String): Either[Throwable, Map[String, String]] =
-    try {
-      val rows: List[(String, String)] =
-        sql"SELECT language, title FROM articles WHERE url = $url"
-          .query[(String, String)].to[List].transact(transactor).unsafeRunSync()
-      Right(rows.toMap)
-    } catch {
-      case e: Exception =>
-        logger.error(s"Failed to load titles by url=$url: ${e.getMessage}", e)
-        Left(e)
-    }
-
-  /** Largest article id currently in the table, or None if empty. */
-  def latestId(): Either[Throwable, Option[Long]] =
-    try
-      Right(
-        sql"SELECT MAX(id) FROM articles"
-          .query[Option[Long]]
-          .unique
-          .transact(transactor)
-          .unsafeRunSync()
-      )
-    catch {
-      case e: Exception =>
-        logger.error(s"Failed to fetch latest article id: ${e.getMessage}", e)
         Left(e)
     }
 

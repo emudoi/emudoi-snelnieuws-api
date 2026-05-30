@@ -32,8 +32,8 @@ import java.time.OffsetDateTime
   *     article id we already sent in the last 24 h to a new pool.
   *
   * JSONB round-trips through `String` with `::jsonb` casts — same
-  * pattern as TopSummaryRepository / AppClientRepository, since
-  * doobie-postgres-circe isn't on the classpath in this build.
+  * pattern as AppClientRepository, since doobie-postgres-circe isn't
+  * on the classpath in this build.
   */
 class NotificationCandidateRepository(provideTransactor: => HikariTransactor[IO]) {
 

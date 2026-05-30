@@ -4,7 +4,6 @@ import com.snelnieuws.{DatabaseTestSupport, StubFcmMessagingService}
 import com.snelnieuws.db.Database
 import com.snelnieuws.model.{AndroidSubscribeRequest, ArticleCreate}
 import com.snelnieuws.repository.{
-  AndroidNotificationDispatchRepository,
   AndroidNotificationSubscriptionRepository,
   ArticleRepository,
   FeatureFlagRepository,
@@ -18,35 +17,29 @@ class AndroidNotificationServiceSpec
     with Matchers
     with DatabaseTestSupport {
 
-  private lazy val articleRepo    = new ArticleRepository(Database.transactor)
-  private lazy val subRepo        = new AndroidNotificationSubscriptionRepository(Database.transactor)
-  private lazy val dispatchRepo   = new AndroidNotificationDispatchRepository(Database.transactor)
-  private lazy val flagRepo       = new FeatureFlagRepository(Database.transactor)
-  private lazy val topSummaryRepo = new com.snelnieuws.repository.TopSummaryRepository(Database.transactor)
-  private lazy val candidateRepo  = new NotificationCandidateRepository(Database.transactor)
+  private lazy val articleRepo   = new ArticleRepository(Database.transactor)
+  private lazy val subRepo       = new AndroidNotificationSubscriptionRepository(Database.transactor)
+  private lazy val flagRepo      = new FeatureFlagRepository(Database.transactor)
+  private lazy val candidateRepo = new NotificationCandidateRepository(Database.transactor)
 
   private def newService(fcm: Option[FcmMessagingService] = None) =
-    new AndroidNotificationService(articleRepo, subRepo, dispatchRepo, flagRepo, topSummaryRepo,
-      candidateRepo, fcm = fcm)
+    new AndroidNotificationService(articleRepo, subRepo, flagRepo, candidateRepo, fcm = fcm)
 
-  /** Seed an undispatched top_summary so dispatch() finds work to do.
-    * Mirrors the helper in NotificationServiceSpec — see that file
-    * for the why. */
-  private def seedTopSummary(
-    messages: Map[String, String] = Map("en" -> "test clickbait headline")
-  ): Long = {
-    val payload = com.snelnieuws.model.TopStoryPayload(
-      representativeArticleId = scala.util.Random.nextLong().abs,
-      topNews                 = io.circe.Json.obj(),
-      notificationMessages    = messages,
-      selectionTier           = 1,
-      selectionMetadata       = io.circe.Json.obj()
-    )
-    topSummaryRepo.insert(payload).fold(
-      e => throw new RuntimeException(s"seedTopSummary failed: ${e.getMessage}"),
-      identity
-    )
-  }
+  /** Insert a fresh (newest) "en" article so the per-language pool has a
+    * claimable candidate this tick (Tier-4 fill always includes the
+    * most-recent unconsumed article). */
+  private def seedRecentArticle(tag: String): Long =
+    articleRepo.create(
+      ArticleCreate(
+        author      = Some(s"$tag.example"),
+        title       = s"$tag headline",
+        description = None,
+        url         = s"https://example.com/$tag-${java.util.UUID.randomUUID()}",
+        urlToImage  = None,
+        content     = None,
+        category    = Some("politics")
+      )
+    ).fold(e => throw new RuntimeException(e.getMessage), _.id)
 
   "subscribe" should {
     "upsert a subscription row" in {
@@ -83,8 +76,9 @@ class AndroidNotificationServiceSpec
       val stub    = new StubFcmMessagingService(acceptAll = true)
       val service = newService(Some(stub))
 
-      // §8 dispatch needs a top_summary or it returns NoFreshTopStory.
-      seedTopSummary()
+      // A claimable "en" candidate must exist or dispatch returns
+      // NoFreshTopStory; freq=3 has no subscribers so sent=0.
+      seedRecentArticle("and-spec-notokens")
 
       service.dispatch(frequency = Some(3)) match {
         case Right(DispatchOutcome.Sent(resp)) =>
@@ -95,7 +89,7 @@ class AndroidNotificationServiceSpec
       }
     }
 
-    "send to subscribers for the given frequency when there are new articles" in {
+    "send to subscribers for the given frequency when a candidate exists" in {
       requireDb()
       val stub    = new StubFcmMessagingService(acceptAll = true)
       val service = newService(Some(stub))
@@ -108,93 +102,18 @@ class AndroidNotificationServiceSpec
         )
       ) shouldBe a[Right[_, _]]
 
-      articleRepo.create(
-        ArticleCreate(
-          author      = Some("and-spec"),
-          title       = "AndroidNotificationServiceSpec dispatch trigger",
-          description = None,
-          url         = "https://example.com/and-spec/dispatch",
-          urlToImage  = None,
-          content     = None,
-          category    = Some("and-spec")
-        )
-      ) shouldBe a[Right[_, _]]
-
-      // §8 dispatch needs a top_summary with notification_messages keyed
-      // by the subscribers' notification_language ("en" default).
-      seedTopSummary()
+      seedRecentArticle("and-spec-freq2")
 
       service.dispatch(frequency = Some(2)) match {
         case Right(DispatchOutcome.Sent(resp)) =>
           resp.sent should be >= 1
           resp.failed shouldBe 0
-          resp.newArticles should be >= 1
         case other =>
           fail(s"Expected Sent, got: $other")
       }
 
       stub.batches should not be empty
       stub.batches.flatMap(_.tokens) should contain("and-spec-token-2")
-    }
-
-    "return NoFreshTopStory when no new articles and the pool path is off" in {
-      requireDb()
-      val stub    = new StubFcmMessagingService(acceptAll = true)
-      val service = newService(Some(stub))
-
-      service.dispatch(frequency = Some(2)) match {
-        case Right(DispatchOutcome.NoFreshTopStory) => succeed
-        case other => fail(s"Expected NoFreshTopStory, got: $other")
-      }
-      stub.batches shouldBe empty
-    }
-
-    "track its own watermark independently of iOS dispatches" in {
-      requireDb()
-      val stub    = new StubFcmMessagingService(acceptAll = true)
-      val service = newService(Some(stub))
-
-      // Subscribe a single Android device on freq=1.
-      service.subscribe(
-        AndroidSubscribeRequest(
-          deviceId  = "and-spec-device-watermark",
-          fcmToken  = "and-spec-token-watermark",
-          frequency = 1
-        )
-      ) shouldBe a[Right[_, _]]
-
-      // Two distinct Android dispatches with one fresh article between
-      // them should each see exactly one new article — the iOS dispatch
-      // service writing to its own table must not move the Android marker.
-      articleRepo.create(
-        ArticleCreate(
-          author      = Some("and-spec"),
-          title       = "Android watermark — first",
-          description = None,
-          url         = "https://example.com/and-spec/watermark-1",
-          urlToImage  = None,
-          content     = None,
-          category    = Some("and-spec")
-        )
-      ) shouldBe a[Right[_, _]]
-
-      // §8 needs a fresh top_summary for each dispatch that expects Sent
-      // with non-zero counts — without one, dispatch returns
-      // NoFreshTopStory. Only seed for the first dispatch; the second
-      // has no fresh articles so the legacy path returns NoFreshTopStory.
-      seedTopSummary()
-
-      service.dispatch(frequency = Some(1)) match {
-        case Right(DispatchOutcome.Sent(resp)) => resp.newArticles should be >= 1
-        case other                              => fail(s"Expected Sent, got: $other")
-      }
-
-      // No new articles + pool flag off → NoFreshTopStory (legacy path
-      // window is empty so the selector returns None).
-      service.dispatch(frequency = Some(1)) match {
-        case Right(DispatchOutcome.NoFreshTopStory) => succeed
-        case other => fail(s"Expected NoFreshTopStory, got: $other")
-      }
     }
   }
 

@@ -25,8 +25,7 @@ case class SubscribeRequest(
 
 case class DispatchResponse(
   sent: Int,
-  failed: Int,
-  newArticles: Int
+  failed: Int
 )
 
 case class User(

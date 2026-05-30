@@ -18,16 +18,13 @@ import com.snelnieuws.auth.FirebaseTokenVerifier
 import com.snelnieuws.db.Database
 import com.snelnieuws.kafka.SummarizedImportKafkaConfig
 import com.snelnieuws.repository.{
-  AndroidNotificationDispatchRepository,
   AndroidNotificationSubscriptionRepository,
   AppClientRepository,
   ArticleRepository,
   FeatureFlagRepository,
   ImageCacheRepository,
   NotificationCandidateRepository,
-  NotificationDispatchRepository,
   NotificationSubscriptionRepository,
-  TopSummaryRepository,
   UserRepository,
   UserSemanticQueryRepository
 }
@@ -78,12 +75,8 @@ class Components(
     new ArticleRepository(provideTransactor)
   lazy val notificationSubscriptionRepository: NotificationSubscriptionRepository =
     new NotificationSubscriptionRepository(provideTransactor)
-  lazy val notificationDispatchRepository: NotificationDispatchRepository =
-    new NotificationDispatchRepository(provideTransactor)
   lazy val androidNotificationSubscriptionRepository: AndroidNotificationSubscriptionRepository =
     new AndroidNotificationSubscriptionRepository(provideTransactor)
-  lazy val androidNotificationDispatchRepository: AndroidNotificationDispatchRepository =
-    new AndroidNotificationDispatchRepository(provideTransactor)
   lazy val userRepository: UserRepository =
     new UserRepository(provideTransactor)
   lazy val appClientRepository: AppClientRepository =
@@ -236,11 +229,7 @@ class Components(
       publicBaseUrl         = imagesPublicBaseUrl
     )
 
-  // ── Top-stories table (notifications_clickbait_tasks.txt §5 + §8) ──
-  lazy val topSummaryRepository: TopSummaryRepository =
-    new TopSummaryRepository(provideTransactor)
-
-  // ── V29 fallback-pool storage. Shared across iOS + Android since
+  // ── Per-language candidate pool. Shared across iOS + Android since
   //    the table itself is platform-agnostic; each service writes its
   //    own per-language pool independently (rows are keyed by run_id
   //    + language, so the two services never collide).
@@ -251,9 +240,7 @@ class Components(
     new NotificationService(
       articleRepository,
       notificationSubscriptionRepository,
-      notificationDispatchRepository,
       featureFlagRepository,
-      topSummaryRepository,
       notificationCandidateRepository,
       apnsProd    = apns,
       apnsSandbox = apnsSandbox
@@ -263,21 +250,10 @@ class Components(
     new AndroidNotificationService(
       articleRepository,
       androidNotificationSubscriptionRepository,
-      androidNotificationDispatchRepository,
       featureFlagRepository,
-      topSummaryRepository,
       notificationCandidateRepository,
       fcm = fcm
     )
-
-  // 2026-05-24: top-stories Kafka consumer REMOVED. The inline
-  // top-story selection in NotificationService.dispatch +
-  // AndroidNotificationService.dispatch replaces the snelmind→
-  // ingestion-api→Kafka→TopStoryConsumer→top_summaries pipeline.
-  // top_summaries is still INSERTed (by the dispatch path itself,
-  // for audit), but never POPULATED from Kafka anymore. The
-  // `kafka.top-stories` config block in application.conf is dead
-  // weight and removed too.
 
   lazy val userService: UserService =
     new UserService(

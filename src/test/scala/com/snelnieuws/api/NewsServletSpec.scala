@@ -559,7 +559,8 @@ class NewsServletSpec
         status shouldBe 200
       }
 
-      // Add a fresh article so newArticles >= 1.
+      // A fresh "en" article gives the per-language pool a claimable
+      // candidate (default language is "en", matching the subscriber).
       val articleBody = """{
         "title":       "Dispatch Trigger Article",
         "url":         "https://example.com/dispatch/1"
@@ -568,54 +569,22 @@ class NewsServletSpec
         status shouldBe 201
       }
 
-      // §8 dispatch flow requires a fresh top_summary row;
-      // notification_messages keys map to subscribers'
-      // notification_language (default "en").
-      val seedPayload = com.snelnieuws.model.TopStoryPayload(
-        representativeArticleId = scala.util.Random.nextLong().abs,
-        topNews                 = io.circe.Json.obj(),
-        notificationMessages    = Map("en" -> "dispatch-spec headline"),
-        selectionTier           = 1,
-        selectionMetadata       = io.circe.Json.obj()
-      )
-      components.topSummaryRepository.insert(seedPayload) shouldBe a[Right[_, _]]
-
       post(
         "/notifications/dispatch?frequency=4",
         "",
         jsonHeader ++ Map("X-API-Key" -> testApiKey)
       ) {
         status shouldBe 200
-        val parsed     = org.json4s.jackson.parseJson(body)
-        val sent       = (parsed \ "sent").extract[Int]
-        val failed     = (parsed \ "failed").extract[Int]
-        val newArticles = (parsed \ "newArticles").extract[Int]
+        val parsed = org.json4s.jackson.parseJson(body)
+        val sent   = (parsed \ "sent").extract[Int]
+        val failed = (parsed \ "failed").extract[Int]
         sent should be >= 1
         failed shouldBe 0
-        newArticles should be >= 1
       }
 
       val batches = stubApns.batches
       batches should not be empty
       batches.flatMap(_.tokens) should contain("dispatch-token-1")
-    }
-
-    "return 503 no_fresh_top_story when there are no new articles since last dispatch" in {
-      requireDb()
-      // The previous test's recordDispatch makes lastAsOfArticleId equal
-      // to the current latest, so newArticles is 0 here. With the early
-      // return gone and the pool flag off, the legacy path's empty
-      // window short-circuits to NoFreshTopStory → 503.
-      stubApns.clear()
-      post(
-        "/notifications/dispatch?frequency=4",
-        "",
-        jsonHeader ++ Map("X-API-Key" -> testApiKey)
-      ) {
-        status shouldBe 503
-        body should include("no_fresh_top_story")
-      }
-      stubApns.batches shouldBe empty
     }
   }
 }

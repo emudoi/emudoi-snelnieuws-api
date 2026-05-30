@@ -7,7 +7,6 @@ import com.snelnieuws.repository.{
   ArticleRepository,
   FeatureFlagRepository,
   NotificationCandidateRepository,
-  NotificationDispatchRepository,
   NotificationSubscriptionRepository
 }
 import org.scalatest.matchers.should.Matchers
@@ -18,39 +17,32 @@ class NotificationServiceSpec
     with Matchers
     with DatabaseTestSupport {
 
-  private lazy val articleRepo      = new ArticleRepository(Database.transactor)
-  private lazy val subRepo          = new NotificationSubscriptionRepository(Database.transactor)
-  private lazy val dispatchRepo     = new NotificationDispatchRepository(Database.transactor)
-  private lazy val flagRepo         = new FeatureFlagRepository(Database.transactor)
-  private lazy val topSummaryRepo   = new com.snelnieuws.repository.TopSummaryRepository(Database.transactor)
-  private lazy val candidateRepo    = new NotificationCandidateRepository(Database.transactor)
+  private lazy val articleRepo   = new ArticleRepository(Database.transactor)
+  private lazy val subRepo       = new NotificationSubscriptionRepository(Database.transactor)
+  private lazy val flagRepo      = new FeatureFlagRepository(Database.transactor)
+  private lazy val candidateRepo = new NotificationCandidateRepository(Database.transactor)
 
   private def newService(apnsProd: Option[ApnsMessagingService] = None,
                          apnsSandbox: Option[ApnsMessagingService] = None) =
-    new NotificationService(articleRepo, subRepo, dispatchRepo, flagRepo, topSummaryRepo,
+    new NotificationService(articleRepo, subRepo, flagRepo,
       candidateRepo, apnsProd = apnsProd, apnsSandbox = apnsSandbox)
 
-  /** Seed an undispatched top_summary so dispatch() finds work to do.
-    * Required by every test that exercises the post-§8 dispatch path
-    * — without one, the new flow returns DispatchOutcome.NoFreshTopStory
-    * for any non-zero newArticles count. notification_messages keys
-    * mirror the subscribers' notification_language (default "en") so
-    * the per-language fan-out picks up the configured tokens. */
-  private def seedTopSummary(
-    messages: Map[String, String] = Map("en" -> "test clickbait headline")
-  ): Long = {
-    val payload = com.snelnieuws.model.TopStoryPayload(
-      representativeArticleId = scala.util.Random.nextLong().abs,
-      topNews                 = io.circe.Json.obj(),
-      notificationMessages    = messages,
-      selectionTier           = 1,
-      selectionMetadata       = io.circe.Json.obj()
-    )
-    topSummaryRepo.insert(payload).fold(
-      e => throw new RuntimeException(s"seedTopSummary failed: ${e.getMessage}"),
-      identity
-    )
-  }
+  /** Insert a fresh (newest) "en" article so the per-language pool has a
+    * claimable candidate this tick. selectTopN's Tier-4 fill always
+    * includes the most-recent article, and it hasn't been consumed, so
+    * dispatch resolves a pick for "en". */
+  private def seedRecentArticle(tag: String): Long =
+    articleRepo.create(
+      ArticleCreate(
+        author      = Some(s"$tag.example"),
+        title       = s"$tag headline",
+        description = None,
+        url         = s"https://example.com/$tag-${java.util.UUID.randomUUID()}",
+        urlToImage  = None,
+        content     = None,
+        category    = Some("politics")
+      )
+    ).fold(e => throw new RuntimeException(e.getMessage), _.id)
 
   "subscribe" should {
     "upsert a subscription row" in {
@@ -92,12 +84,11 @@ class NotificationServiceSpec
       val stub    = new StubApnsMessagingService(acceptAll = true)
       val service = newService(apnsProd = Some(stub))
 
-      // §8 dispatch path needs a fresh top_summary; otherwise it returns
-      // NoFreshTopStory instead of Sent. Seed one with no language
-      // overlap so the per-language fan-out yields zero tokens anyway.
-      seedTopSummary()
+      // A claimable "en" candidate must exist, otherwise dispatch returns
+      // NoFreshTopStory instead of Sent. Use a frequency tier with no
+      // subscribers so the per-language fan-out yields zero tokens.
+      seedRecentArticle("ns-spec-notokens")
 
-      // Use a frequency tier we know has no subscribers.
       service.dispatch(frequency = Some(3), environment = "production") match {
         case Right(DispatchOutcome.Sent(resp)) =>
           resp.sent shouldBe 0
@@ -107,30 +98,23 @@ class NotificationServiceSpec
       }
     }
 
-    // 2026-05-24 regression: with the inline top-story refactor, the
-    // dispatch path picks the story from the (lastAsOf, currentMax]
-    // article window — NOT from a pre-seeded top_summary row. This
-    // test inserts 3 articles and verifies (a) a top_summary row was
-    // CREATED by the dispatch (audit), (b) the notification was sent
-    // with a body listing the language keys, and (c) the title format
-    // includes the "N new articles" suffix.
-    "compose top story inline from articles window (post-refactor)" in {
+    "claim a per-language top story and send it to that language's subscribers" in {
       requireDb()
       val stub    = new StubApnsMessagingService(acceptAll = true)
       val service = newService(apnsProd = Some(stub))
 
       service.subscribe(
         SubscribeRequest(
-          deviceId  = "ns-spec-inline-1",
-          apnsToken = "ns-spec-token-inline-1",
-          frequency = 4,
+          deviceId    = "ns-spec-inline-1",
+          apnsToken   = "ns-spec-token-inline-1",
+          frequency   = 4,
           environment = "production"
         )
       ) shouldBe a[Right[_, _]]
 
       // Three articles from the SAME author (publisher) in politics →
       // Tier 2 single-publisher fallback fires; rep article = latest.
-      val ids = (1 to 3).map { i =>
+      (1 to 3).foreach { i =>
         articleRepo.create(
           ArticleCreate(
             author      = Some("inline.example"),
@@ -143,31 +127,23 @@ class NotificationServiceSpec
           )
         ).fold(e => fail(e.getMessage), identity)
       }
-      val countBefore = topSummaryRepo.findLatestUndispatched()
-        .fold(e => fail(e.getMessage), _.map(_.id).getOrElse(0L))
 
       service.dispatch(frequency = Some(4), environment = "production") match {
         case Right(DispatchOutcome.Sent(resp)) =>
-          resp.sent       should be >= 1
-          resp.newArticles should be >= 3
+          resp.sent should be >= 1
         case other => fail(s"Expected Sent, got: $other")
       }
 
-      // The inline path INSERTed a fresh top_summary AND immediately
-      // marked it dispatched. findLatestUndispatched should NOT have
-      // returned that fresh row.
-      val sentBatches = stub.batches.flatMap(_.tokens)
-      sentBatches should contain("ns-spec-token-inline-1")
-      val titles = stub.batches.map(_.title)
-      titles.exists(_.contains("new articles")) shouldBe true
+      stub.batches.flatMap(_.tokens) should contain("ns-spec-token-inline-1")
+      // Title is the article headline, with no trailing "N new articles" suffix.
+      stub.batches.map(_.title).foreach(_ should not include "new articles")
     }
 
-    "send to subscribers for the given frequency when there are new articles" in {
+    "send to subscribers for the given frequency when a candidate exists" in {
       requireDb()
       val stub    = new StubApnsMessagingService(acceptAll = true)
       val service = newService(apnsProd = Some(stub))
 
-      // Subscribe a unique device on frequency=2 (default environment=production).
       service.subscribe(
         SubscribeRequest(
           deviceId  = "ns-spec-device-2",
@@ -176,100 +152,18 @@ class NotificationServiceSpec
         )
       ) shouldBe a[Right[_, _]]
 
-      // Insert a fresh article so countSinceId > 0.
-      articleRepo.create(
-        ArticleCreate(
-          author      = Some("ns-spec"),
-          title       = "NotificationServiceSpec dispatch trigger",
-          description = None,
-          url         = "https://example.com/ns-spec/dispatch",
-          urlToImage  = None,
-          content     = None,
-          category    = Some("ns-spec")
-        )
-      ) shouldBe a[Right[_, _]]
-
-      // §8 dispatch flow needs a top_summary AND non-empty notification_messages
-      // for the subscriber's notification_language ('en' default).
-      seedTopSummary()
+      seedRecentArticle("ns-spec-freq2")
 
       service.dispatch(frequency = Some(2), environment = "production") match {
         case Right(DispatchOutcome.Sent(resp)) =>
           resp.sent should be >= 1
           resp.failed shouldBe 0
-          resp.newArticles should be >= 1
         case other =>
           fail(s"Expected Sent, got: $other")
       }
 
       stub.batches should not be empty
       stub.batches.flatMap(_.tokens) should contain("ns-spec-token-2")
-    }
-
-    "return NoFreshTopStory when no new articles and the pool path is off" in {
-      requireDb()
-      val stub    = new StubApnsMessagingService(acceptAll = true)
-      val service = newService(apnsProd = Some(stub))
-
-      // Frequency=2 was just dispatched in the previous test — no fresh inserts here.
-      // Legacy path: empty (lastAsOf, currentMax] window → selector None →
-      // NoFreshTopStory. Pool path off, so no older candidate to drain.
-      service.dispatch(frequency = Some(2), environment = "production") match {
-        case Right(DispatchOutcome.NoFreshTopStory) => succeed
-        case other => fail(s"Expected NoFreshTopStory, got: $other")
-      }
-      stub.batches shouldBe empty
-    }
-
-    // V29 fallback-pool path. Flips the feature flag on, exercises the
-    // per-language pool flow, and verifies that the dispatch sends a
-    // notification. The legacy flag-off path remains covered by the
-    // surrounding tests. `try/finally` keeps the flag clean even on
-    // assertion failure so downstream tests don't accidentally run on
-    // the pool path.
-    "dispatch via fallback pool when notifications_fallback_pool_enabled is on" in {
-      requireDb()
-      val stub    = new StubApnsMessagingService(acceptAll = true)
-      val service = newService(apnsProd = Some(stub))
-
-      flagRepo.setEnabled(FallbackPoolConfig.FlagName, true) shouldBe a[Right[_, _]]
-      try {
-        // frequency must be BETWEEN 1 AND 4 (V4 CHECK constraint).
-        service.subscribe(
-          SubscribeRequest(
-            deviceId    = "ns-spec-pool-1",
-            apnsToken   = "ns-spec-token-pool-1",
-            frequency   = 4,
-            environment = "production"
-          )
-        ) shouldBe a[Right[_, _]]
-
-        val uniqueTag = java.util.UUID.randomUUID().toString.take(8)
-        (1 to 5).foreach { i =>
-          articleRepo.create(
-            ArticleCreate(
-              author      = Some(s"pool-pub-$i.example"),
-              title       = s"Pool test article $uniqueTag-$i",
-              description = None,
-              url         = s"https://example.com/pool-$uniqueTag-$i",
-              urlToImage  = None,
-              content     = None,
-              category    = Some("politics")
-            )
-          ) shouldBe a[Right[_, _]]
-        }
-
-        service.dispatch(frequency = Some(4), environment = "production") match {
-          case Right(DispatchOutcome.Sent(resp)) =>
-            resp.sent should be >= 1
-            resp.newArticles should be >= 5
-          case other => fail(s"Expected Sent under pool flag, got: $other")
-        }
-
-        stub.batches.flatMap(_.tokens) should contain("ns-spec-token-pool-1")
-      } finally {
-        flagRepo.setEnabled(FallbackPoolConfig.FlagName, false)
-      }
     }
 
     "route sandbox dispatches to the sandbox client and skip production tokens" in {
@@ -296,23 +190,7 @@ class NotificationServiceSpec
         )
       ) shouldBe a[Right[_, _]]
 
-      // Fresh article so we actually attempt sends.
-      articleRepo.create(
-        ArticleCreate(
-          author      = Some("ns-spec"),
-          title       = "NotificationServiceSpec sandbox routing",
-          description = None,
-          url         = "https://example.com/ns-spec/sandbox",
-          urlToImage  = None,
-          content     = None,
-          category    = Some("ns-spec")
-        )
-      ) shouldBe a[Right[_, _]]
-
-      // §8 dispatch path needs a top_summary; subscribers' default
-      // notification_language is 'en' so the seeded "en" message
-      // matches the per-language fan-out.
-      seedTopSummary()
+      seedRecentArticle("ns-spec-sandbox")
 
       service.dispatch(frequency = Some(4), environment = "sandbox") match {
         case Right(DispatchOutcome.Sent(_)) => succeed
