@@ -223,7 +223,7 @@ class NewsServletV2(
   }
 
   get("/app/config") {
-    Map("minVersion" -> "1.4.1")
+    Map("minVersion" -> "1.5.1")
   }
 
   // Android force-upgrade gate. Compared as Int against BuildConfig.VERSION_CODE
@@ -231,8 +231,8 @@ class NewsServletV2(
   // force-update screen. minVersionName is informational only (shown in UI / logs).
   get("/app/config/android") {
     Map(
-      "minVersionCode" -> 140,
-      "minVersionName" -> "1.4.0"
+      "minVersionCode" -> 152,
+      "minVersionName" -> "1.5.1"
     )
   }
 
