@@ -231,8 +231,8 @@ class NewsServletV2(
   // force-update screen. minVersionName is informational only (shown in UI / logs).
   get("/app/config/android") {
     Map(
-      "minVersionCode" -> 140,
-      "minVersionName" -> "1.4.0"
+      "minVersionCode" -> 152,
+      "minVersionName" -> "1.5.1"
     )
   }
 
