@@ -12,8 +12,15 @@ case class SummarizedImportKafkaConfig(
 
 object SummarizedImportKafkaConfig {
 
-  def load(config: Config = ConfigFactory.load()): SummarizedImportKafkaConfig = {
-    val kafka = config.getConfig("kafka.summarized-import")
+  def load(config: Config = ConfigFactory.load()): SummarizedImportKafkaConfig =
+    from(config.getConfig("kafka.summarized-import"))
+
+  /** Eulang summarized import — the `kafka.eulang-import` block (separate topic
+    * + consumer group, persisted into eulang_articles). */
+  def loadEulang(config: Config = ConfigFactory.load()): SummarizedImportKafkaConfig =
+    from(config.getConfig("kafka.eulang-import"))
+
+  private def from(kafka: Config): SummarizedImportKafkaConfig =
     SummarizedImportKafkaConfig(
       bootstrapServers = kafka.getString("bootstrap-servers"),
       topic            = kafka.getString("topic"),
@@ -21,5 +28,4 @@ object SummarizedImportKafkaConfig {
       autoOffsetReset  = kafka.getString("auto-offset-reset"),
       enabled          = kafka.getBoolean("enabled")
     )
-  }
 }

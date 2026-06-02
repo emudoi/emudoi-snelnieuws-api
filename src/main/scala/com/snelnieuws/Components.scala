@@ -73,6 +73,9 @@ class Components(
   // Repositories
   lazy val articleRepository: ArticleRepository =
     new ArticleRepository(provideTransactor)
+  // Eulang (native Dutch-language) track — same query surface, separate table.
+  lazy val eulangArticleRepository: ArticleRepository =
+    new ArticleRepository(provideTransactor, tableName = "eulang_articles")
   lazy val notificationSubscriptionRepository: NotificationSubscriptionRepository =
     new NotificationSubscriptionRepository(provideTransactor)
   lazy val androidNotificationSubscriptionRepository: AndroidNotificationSubscriptionRepository =
@@ -278,6 +281,19 @@ class Components(
       None
     }
 
+  // Retention parity for eulang_articles — same schedule/config as the main
+  // table, just pointed at the eulang repository.
+  lazy val eulangArticleCleanupScheduler: Option[ArticleCleanupScheduler] =
+    if (cleanupCfg.getBoolean("enabled")) {
+      Some(
+        new ArticleCleanupScheduler(
+          articleRepository = eulangArticleRepository,
+          retentionHours    = cleanupCfg.getLong("retention-hours"),
+          intervalMinutes   = cleanupCfg.getLong("interval-minutes")
+        )
+      )
+    } else None
+
   lazy val summarizedArticleConsumer: Option[SummarizedArticleConsumer] = {
     val kafkaCfg = SummarizedImportKafkaConfig.load(rootConfig)
     if (kafkaCfg.enabled) {
@@ -297,6 +313,30 @@ class Components(
       }
     } else {
       logger.info("Summarized-article Kafka consumer is disabled (kafka.summarized-import.enabled=false)")
+      None
+    }
+  }
+
+  // Eulang importer: same consumer class, eulang topic/group + eulang repo,
+  // sharing the one image cache + download worker (both table-agnostic).
+  lazy val eulangArticleConsumer: Option[SummarizedArticleConsumer] = {
+    val kafkaCfg = SummarizedImportKafkaConfig.loadEulang(rootConfig)
+    if (kafkaCfg.enabled) {
+      try Some(
+        new SummarizedArticleConsumer(
+          articleRepository   = eulangArticleRepository,
+          kafkaConfig         = kafkaCfg,
+          imageCacheService   = imageCacheService,
+          imageDownloadWorker = imageDownloadWorker
+        )
+      )
+      catch {
+        case e: Exception =>
+          logger.error(s"Failed to construct eulang-article consumer: ${e.getMessage}", e)
+          None
+      }
+    } else {
+      logger.info("Eulang-article Kafka consumer is disabled (kafka.eulang-import.enabled=false)")
       None
     }
   }
@@ -407,9 +447,11 @@ class Components(
   /** Eagerly resolve background workers and start them. Idempotent. */
   def startBackgroundWorkers(): Unit = {
     articleCleanupScheduler.foreach(_.start())
+    eulangArticleCleanupScheduler.foreach(_.start())
     imageDownloadWorker.start()
     imageCacheCleanupScheduler.foreach(_.start())
     summarizedArticleConsumer.foreach(_.start())
+    eulangArticleConsumer.foreach(_.start())
     imageRetrySlowConsumer.foreach(_.start())
   }
 
@@ -422,11 +464,13 @@ class Components(
     // is stopped after the fast worker so any in-flight hand-offs
     // can land on the topic before the consumer's poll loop exits.
     summarizedArticleConsumer.foreach(_.stop())
+    eulangArticleConsumer.foreach(_.stop())
     imageDownloadWorker.stop()
     imageRetrySlowConsumer.foreach(_.stop())
     kafkaImageRetryProducer.close()
     imageCacheCleanupScheduler.foreach(_.stop())
     articleCleanupScheduler.foreach(_.stop())
+    eulangArticleCleanupScheduler.foreach(_.stop())
   }
 }
 

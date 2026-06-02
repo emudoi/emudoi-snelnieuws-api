@@ -76,7 +76,10 @@ class IngestionApiClient(
     language: Option[String],
     country: Option[String],
     limit: Int = 50,
-    minScore: Double = 0.70
+    minScore: Double = 0.70,
+    // source = "eulang" routes the bridge to the eulang Milvus collection +
+    // eulang_articles hydrate; None keeps the default snelnieuws collection.
+    source: Option[String] = None
   ): Either[Throwable, List[SemanticMatch]] = {
     val fields = scala.collection.mutable.ListBuffer[(String, Json)](
       "embedding" -> Json.fromValues(embedding.toSeq.map(f => Json.fromDoubleOrNull(f.toDouble))),
@@ -85,6 +88,7 @@ class IngestionApiClient(
     )
     language.foreach(l => fields += "language" -> Json.fromString(l))
     country.foreach(c => fields += "country" -> Json.fromString(c))
+    source.foreach(s => fields += "source" -> Json.fromString(s))
     val body = Json.fromFields(fields.toList).noSpaces
     postJson("/api/internal/search/semantic", body).flatMap { resp =>
       decodeSearchResponse(resp)

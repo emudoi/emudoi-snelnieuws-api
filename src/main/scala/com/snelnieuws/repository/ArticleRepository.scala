@@ -11,9 +11,20 @@ import org.slf4j.LoggerFactory
 
 import java.time.{Instant, OffsetDateTime, ZoneOffset}
 
-class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
+/** Article store. `tableName` selects the backing table so the same query
+  * surface serves both the snelnieuws `articles` table (default) and the
+  * eulang `eulang_articles` table — the two are schema-identical. The name is
+  * spliced as a constant Fragment (never user input), so there's no injection
+  * surface. */
+class ArticleRepository(
+  provideTransactor: => HikariTransactor[IO],
+  tableName: String = "articles"
+) {
 
   private val logger = LoggerFactory.getLogger(classOf[ArticleRepository])
+
+  // Constant table-name fragment spliced into every query below.
+  private val table: Fragment = Fragment.const(tableName)
 
   // Resolved lazily so tests can defer DB connection until the container is up.
   private lazy val transactor: HikariTransactor[IO] = provideTransactor
@@ -24,7 +35,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         sql"""
           SELECT id, author, title, description, url, url_to_image,
                  to_char(published_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), content, category
-          FROM articles
+          FROM $table
           ORDER BY published_at DESC
           LIMIT $limit
         """.query[ArticleRow].to[List].transact(transactor).unsafeRunSync()
@@ -41,7 +52,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         sql"""
           SELECT id, author, title, description, url, url_to_image,
                  to_char(published_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), content, category
-          FROM articles
+          FROM $table
           WHERE LOWER(category) = LOWER($category)
           ORDER BY published_at DESC
           LIMIT $limit
@@ -65,7 +76,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         sql"""
           SELECT id, author, title, description, url, url_to_image,
                  to_char(published_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), content, category
-          FROM articles
+          FROM $table
           WHERE LOWER(category) = ANY($lowercased)
           ORDER BY published_at DESC
           LIMIT $limit
@@ -91,7 +102,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         sql"""
           SELECT id, author, title, description, url, url_to_image,
                  to_char(published_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), content, category
-          FROM articles
+          FROM $table
           ORDER BY published_at DESC
           LIMIT $limit
         """.query[ArticleRow].to[List].transact(transactor).unsafeRunSync()
@@ -108,7 +119,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         sql"""
           SELECT id, author, title, description, url, url_to_image,
                  to_char(published_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), content, category
-          FROM articles
+          FROM $table
           WHERE LOWER(category) = LOWER($category)
           ORDER BY published_at DESC
           LIMIT $limit
@@ -127,7 +138,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         sql"""
           SELECT id, author, title, description, url, url_to_image,
                  to_char(published_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), content, category
-          FROM articles
+          FROM $table
           WHERE LOWER(category) = ANY($lowercased)
           ORDER BY published_at DESC
           LIMIT $limit
@@ -146,7 +157,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         sql"""
           SELECT id, author, title, description, url, url_to_image,
                  to_char(published_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), content, category
-          FROM articles
+          FROM $table
           WHERE LOWER(title) LIKE $searchPattern
              OR LOWER(description) LIKE $searchPattern
              OR LOWER(content) LIKE $searchPattern
@@ -164,7 +175,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
     try
       Right(
         sql"""
-          INSERT INTO articles (author, title, description, url, url_to_image, content, category)
+          INSERT INTO $table (author, title, description, url, url_to_image, content, category)
           VALUES (${article.author}, ${article.title}, ${article.description},
                   ${article.url}, ${article.urlToImage}, ${article.content}, ${article.category})
           RETURNING id, author, title, description, url, url_to_image,
@@ -183,7 +194,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
         sql"""
           SELECT id, author, title, description, url, url_to_image,
                  to_char(published_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), content, category
-          FROM articles
+          FROM $table
           WHERE id = $id
         """.query[ArticleRow].option.transact(transactor).unsafeRunSync()
       )
@@ -195,7 +206,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
 
   def delete(id: Long): Either[Throwable, Int] =
     try
-      Right(sql"DELETE FROM articles WHERE id = $id".update.run.transact(transactor).unsafeRunSync())
+      Right(sql"DELETE FROM $table WHERE id = $id".update.run.transact(transactor).unsafeRunSync())
     catch {
       case e: Exception =>
         logger.error(s"Failed to delete article id=$id: ${e.getMessage}", e)
@@ -210,7 +221,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
   def deletePublishedBefore(cutoff: OffsetDateTime): Either[Throwable, Int] =
     try
       Right(
-        sql"DELETE FROM articles WHERE published_at < $cutoff".update.run
+        sql"DELETE FROM $table WHERE published_at < $cutoff".update.run
           .transact(transactor)
           .unsafeRunSync()
       )
@@ -226,7 +237,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
   def distinctLanguages(): Either[Throwable, List[String]] =
     try
       Right(
-        sql"SELECT DISTINCT language FROM articles".query[String].to[List]
+        sql"SELECT DISTINCT language FROM $table".query[String].to[List]
           .transact(transactor).unsafeRunSync()
       )
     catch {
@@ -241,7 +252,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
   def countByLanguage(language: String): Either[Throwable, Int] =
     try
       Right(
-        sql"SELECT COUNT(*) FROM articles WHERE language = $language"
+        sql"SELECT COUNT(*) FROM $table WHERE language = $language"
           .query[Int].unique.transact(transactor).unsafeRunSync()
       )
     catch {
@@ -258,7 +269,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
   ): Either[Throwable, Int] =
     try
       Right(
-        sql"DELETE FROM articles WHERE language = $language AND published_at < $cutoff"
+        sql"DELETE FROM $table WHERE language = $language AND published_at < $cutoff"
           .update.run.transact(transactor).unsafeRunSync()
       )
     catch {
@@ -272,7 +283,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
   def count(): Either[Throwable, Int] =
     try
       Right(
-        sql"SELECT COUNT(*) FROM articles".query[Int].unique
+        sql"SELECT COUNT(*) FROM $table".query[Int].unique
           .transact(transactor)
           .unsafeRunSync()
       )
@@ -304,7 +315,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
                published_at, content, category, country,
                COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
                language
-        FROM articles
+        FROM $table
         WHERE language = $language
           AND published_at >= $since
         ORDER BY id ASC
@@ -325,7 +336,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
       Right(
         sql"""
           SELECT DISTINCT category
-          FROM articles
+          FROM $table
           WHERE category IS NOT NULL AND category <> ''
           ORDER BY category
         """.query[String].to[List].transact(transactor).unsafeRunSync()
@@ -363,7 +374,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
                published_at, content, category, country,
                COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
                language
-        FROM articles
+        FROM $table
         WHERE language = $language
       """
 
@@ -427,7 +438,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
                published_at, content, category, country,
                COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
                language
-        FROM articles
+        FROM $table
         WHERE language = $language
       """
       val categoryFilter: Fragment =
@@ -470,7 +481,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
                    published_at, content, category, country,
                    COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
                    language
-            FROM articles
+            FROM $table
             WHERE url = ANY($urls)
               AND language = $language
           """.query[ArticleV3Row].to[List].transact(transactor).unsafeRunSync()
@@ -493,7 +504,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
                  published_at, content, category, country,
                  COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
                  language
-          FROM articles
+          FROM $table
           WHERE id = $id AND language = $language
         """.query[ArticleV3Row].option.transact(transactor).unsafeRunSync()
       )
@@ -518,7 +529,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
       val language = article.language.getOrElse("en")
       Right(
         sql"""
-          INSERT INTO articles (author, title, description, url, url_to_image, published_at, content,
+          INSERT INTO $table (author, title, description, url, url_to_image, published_at, content,
                                 category, shared_categories, country, shared_countries, language)
           VALUES (${article.author}, ${article.title}, ${article.description},
                   ${article.url}, ${article.urlToImage}, $publishedAt, NULL,
@@ -554,7 +565,7 @@ class ArticleRepository(provideTransactor: => HikariTransactor[IO]) {
     try
       Right(
         sql"""
-          UPDATE articles
+          UPDATE $table
           SET url_to_image = '/v2/images/_fallback'
           WHERE title = $title
         """.update.run.transact(transactor).unsafeRunSync()
