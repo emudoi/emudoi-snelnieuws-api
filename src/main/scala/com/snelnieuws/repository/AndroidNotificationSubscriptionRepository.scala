@@ -59,17 +59,18 @@ class AndroidNotificationSubscriptionRepository(provideTransactor: => HikariTran
     }
 
   /** Per-language token bucketing for the Android clickbait dispatch
-    * flow (notifications_clickbait_tasks.txt §8). When `frequency` is
-    * Some(N), only rows whose frequency matches are returned; None
-    * broadcasts across all frequencies. Backed by
-    * idx_android_notif_sub_lang (V25 index). */
+    * flow (notifications_clickbait_tasks.txt §8). `frequency` is the
+    * slot threshold: Some(N) returns every row whose picked frequency
+    * is >= N, so one slot reaches everyone at or above its threshold
+    * (07:00→4, 17:00→3, 19:00→2, 21:00→1). None broadcasts across all
+    * frequencies. Backed by idx_android_notif_sub_lang (V25 index). */
   def findTokensByLanguageGrouped(
     frequency: Option[Int] = None
   ): Either[Throwable, Map[String, List[String]]] =
     try {
       val baseFr = fr"""SELECT notification_language, fcm_token
                        FROM android_notification_subscriptions"""
-      val whereFr = frequency.map(f => fr"WHERE frequency = $f").getOrElse(Fragment.empty)
+      val whereFr = frequency.map(f => fr"WHERE frequency >= $f").getOrElse(Fragment.empty)
       val rows = (baseFr ++ whereFr)
         .query[(String, String)].to[List]
         .transact(transactor).unsafeRunSync()

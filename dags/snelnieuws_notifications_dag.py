@@ -4,9 +4,9 @@ Four DAGs in this file:
 
   - snelnieuws_notifications_prod              → fan-out to iOS (production
         APNs) + Android (FCM) in parallel. One trigger, both platforms.
-        Triggered automatically by snelnieuws_notifications_auto_watcher
-        when its quiet-hour / cooldown / daily-cap gates all pass, and
-        also available as a manual trigger from the Airflow UI.
+        Triggered automatically by snelnieuws_notifications_slots at each
+        daily slot (with a frequency threshold in conf), and also
+        available as a manual trigger from the Airflow UI.
         iOS path: POST /notifications/dispatch — App Store + TestFlight
         builds whose tokens work against api.push.apple.com.
         Android path: POST /android/notifications/dispatch — every Android
@@ -26,14 +26,22 @@ Four DAGs in this file:
           notify_android          → all Android subscribers
         Flip rows in psql to enable/disable per side without redeploying.
 
-  - snelnieuws_notifications_auto_watcher      → scheduled every 5 minutes.
-        Triggers snelnieuws_notifications_prod on a fixed cadence inside
-        the 07:00–19:00 Amsterdam active window, with ≥ 3 h between fires
-        and ≤ 4 fires per Amsterdam day. The dispatch endpoints decide
-        per language whether there is anything fresh to send (from the
-        notification_candidates pool); the watcher no longer gates on an
-        article-id delta. Manual runs of snelnieuws_notifications_prod do
-        not count against the cap.
+  - snelnieuws_notifications_slots             → four scheduled fires per
+        Amsterdam day at fixed slots — 07:00, 17:00, 19:00, 21:00 — with
+        a silent window between 07:00 and 17:00. Each slot triggers
+        snelnieuws_notifications_prod with a `frequency` threshold so a
+        subscriber's picked frequency (1–4) decides which slots reach
+        them, filling from the evening backward:
+
+          slot   threshold (frequency >=)   reaches picks
+          07:00  4                          4
+          17:00  3                          3, 4
+          19:00  2                          2, 3, 4
+          21:00  1                          1, 2, 3, 4
+
+        The dispatch endpoints still decide per language whether there is
+        anything fresh to send (notification_candidates pool); a slot with
+        no fresh candidate for any language sends nothing.
 
 Content selection + dedup live entirely in the API: each dispatch builds a
 per-language candidate pool from that language's recent articles and claims
@@ -45,14 +53,6 @@ environments. The shared X-API-Key is read from an Airflow Variable
 (populated from Vault by emudoi-service-infra's vault-publish role):
 
   - `snelnieuws_notifications_api_key` → shared secret in X-API-Key header
-
-Watcher state is kept in Airflow Variables:
-
-  - `snelnieuws_last_fired_at_utc`              → ISO-8601 UTC timestamp
-        of the most recent auto-fire. Enforces the ≥ 3 h cooldown.
-  - `snelnieuws_auto_trigger_count_YYYY_MM_DD`  → per-day auto-trigger
-        counter, capped at 4. Keyed by the Amsterdam date of the fire
-        time itself (not by any upstream summarize run).
 """
 import pendulum
 import requests
@@ -69,21 +69,24 @@ BROADCAST_ENDPOINT_ANDROID = "https://api.snel.emudoi.com/android/notifications/
 
 DISPATCH_TIMEOUT_S = 60
 
-PROD_DAG_ID               = "snelnieuws_notifications_prod"
-MAX_AUTO_TRIGGERS_PER_DAY = 4
-ACTIVE_WINDOW_START_HOUR  = 7
-ACTIVE_WINDOW_END_HOUR    = 19
-MIN_COOLDOWN_HOURS        = 3  # 2026-05-24: was 2; spreads MAX_AUTO_TRIGGERS_PER_DAY=4 across the 12h ACTIVE_WINDOW (07-19 Amsterdam) instead of clustering them in the first 8h
-AMSTERDAM = pendulum.timezone("Europe/Amsterdam")
+PROD_DAG_ID = "snelnieuws_notifications_prod"
+AMSTERDAM   = pendulum.timezone("Europe/Amsterdam")
 
-VAR_LAST_FIRED_AT_UTC = "snelnieuws_last_fired_at_utc"
-VAR_COUNTER_PREFIX    = "snelnieuws_auto_trigger_count_"  # + YYYY_MM_DD
+# Fixed daily slots → frequency threshold passed to the dispatch endpoints.
+# A subscriber whose picked frequency is >= the slot threshold is reached,
+# so coverage fills from the evening backward (pick 1 → 21:00 only, pick 4 →
+# every slot). The 07:00–17:00 gap is the daytime silent window.
+SLOT_THRESHOLDS = {7: 4, 17: 3, 19: 2, 21: 1}
 
 
-def _post_dispatch(endpoint: str) -> dict:
+def _post_dispatch(endpoint: str, frequency=None) -> dict:
     api_key = Variable.get("snelnieuws_notifications_api_key")
+    params = {}
+    if frequency is not None and str(frequency).strip() != "":
+        params["frequency"] = int(frequency)
     r = requests.post(
         endpoint,
+        params=params,
         headers={"X-API-Key": api_key},
         timeout=DISPATCH_TIMEOUT_S,
     )
@@ -111,24 +114,42 @@ def _post_broadcast(endpoint: str, text: str) -> dict:
     description=(
         "Dispatch SnelNieuws push notifications. Fans out to iOS "
         "(production APNs) and Android (FCM) in parallel — one trigger, "
-        "both platforms. Auto-triggered by snelnieuws_notifications_auto_watcher "
-        "on a fixed cadence inside the Amsterdam active window; "
-        "also available for manual runs."
+        "both platforms. Auto-triggered by snelnieuws_notifications_slots "
+        "at each daily slot with a `frequency` threshold in conf; also "
+        "available for manual runs (leave frequency empty to reach all)."
     ),
     schedule=None,
     start_date=pendulum.datetime(2026, 5, 1, tz="Europe/Amsterdam"),
     catchup=False,
     max_active_runs=1,
+    params={
+        "frequency": Param(
+            default="",
+            type="string",
+            description=(
+                "Slot threshold: only subscribers whose picked frequency is "
+                ">= this value are notified. Empty → reach all frequencies."
+            ),
+        ),
+    },
     tags=["snelnieuws", "notifications"],
 )
 def snelnieuws_notifications_prod():
+    def _frequency(context) -> object:
+        # conf wins (set by snelnieuws_notifications_slots); fall back to the
+        # manual-trigger Param. Either may be "" / None → reach all.
+        conf = context["dag_run"].conf or {}
+        if "frequency" in conf:
+            return conf.get("frequency")
+        return (context["params"] or {}).get("frequency")
+
     @task
-    def dispatch_ios() -> dict:
-        return _post_dispatch(PROD_ENDPOINT_IOS)
+    def dispatch_ios(**context) -> dict:
+        return _post_dispatch(PROD_ENDPOINT_IOS, _frequency(context))
 
     @task(trigger_rule="all_done")
-    def dispatch_android() -> dict:
-        return _post_dispatch(DISPATCH_ENDPOINT_ANDROID)
+    def dispatch_android(**context) -> dict:
+        return _post_dispatch(DISPATCH_ENDPOINT_ANDROID, _frequency(context))
 
     dispatch_ios()
     dispatch_android()
@@ -194,69 +215,46 @@ def snelnieuws_notifications_broadcast_manual():
 
 
 @dag(
-    dag_id="snelnieuws_notifications_auto_watcher",
+    dag_id="snelnieuws_notifications_slots",
     description=(
-        "Triggers snelnieuws_notifications_prod on a fixed cadence inside "
-        "07:00–19:00 Amsterdam, with ≥ 3 h between fires and ≤ 4 fires per "
-        "day. The dispatch endpoints decide per language whether there is "
-        "anything fresh to send (notification_candidates pool)."
+        "Fires snelnieuws_notifications_prod at four fixed Amsterdam slots — "
+        "07:00, 17:00, 19:00, 21:00 — each with a frequency threshold "
+        "(07→4, 17→3, 19→2, 21→1) so a subscriber's picked frequency decides "
+        "which slots reach them. Silent window between 07:00 and 17:00."
     ),
-    schedule="*/5 * * * *",
+    schedule="0 7,17,19,21 * * *",
     start_date=pendulum.datetime(2026, 5, 15, tz="Europe/Amsterdam"),
     catchup=False,
     max_active_runs=1,
     tags=["snelnieuws", "notifications", "auto"],
 )
-def snelnieuws_notifications_auto_watcher():
-    @task.short_circuit
-    def check_quiet_hours() -> bool:
-        hour = pendulum.now(AMSTERDAM).hour
-        return ACTIVE_WINDOW_START_HOUR <= hour < ACTIVE_WINDOW_END_HOUR
-
-    @task.short_circuit
-    def check_daily_cap() -> bool:
-        today_key = pendulum.now(AMSTERDAM).strftime("%Y_%m_%d")
-        count = int(Variable.get(VAR_COUNTER_PREFIX + today_key, default_var="0"))
-        return count < MAX_AUTO_TRIGGERS_PER_DAY
-
-    @task.short_circuit
-    def check_cooldown() -> bool:
-        last_fired_str = Variable.get(VAR_LAST_FIRED_AT_UTC, default_var="")
-        if not last_fired_str:
-            return True
-        last_fired = pendulum.parse(last_fired_str)
-        return (pendulum.now("UTC") - last_fired).total_seconds() >= MIN_COOLDOWN_HOURS * 3600
-
+def snelnieuws_notifications_slots():
     @task
-    def advance_state() -> None:
-        now_utc = pendulum.now("UTC")
-        today_key = pendulum.now(AMSTERDAM).strftime("%Y_%m_%d")
-        counter_var = VAR_COUNTER_PREFIX + today_key
+    def resolve_threshold() -> int:
+        # The DAG only fires at the configured slot hours; snap to the
+        # nearest one so brief scheduler lag still maps to the right slot.
+        hour = pendulum.now(AMSTERDAM).hour
+        nearest = min(SLOT_THRESHOLDS, key=lambda h: abs(h - hour))
+        return SLOT_THRESHOLDS[nearest]
 
-        Variable.set(VAR_LAST_FIRED_AT_UTC, now_utc.isoformat())
-        Variable.set(
-            counter_var,
-            str(int(Variable.get(counter_var, default_var="0")) + 1),
-        )
-
-    quiet_ok = check_quiet_hours()
-    cap_ok = check_daily_cap()
-    cool_ok = check_cooldown()
+    threshold = resolve_threshold()
 
     trigger = TriggerDagRunOperator(
         task_id="trigger_prod_notifications",
         trigger_dag_id=PROD_DAG_ID,
-        trigger_run_id="auto__{{ ts_nodash }}",
-        conf={"source": "auto_watcher"},
+        trigger_run_id="slot__{{ ts_nodash }}",
+        conf={
+            "source": "slots",
+            "frequency": "{{ ti.xcom_pull(task_ids='resolve_threshold') }}",
+        },
         reset_dag_run=False,
         wait_for_completion=False,
     )
 
-    advance = advance_state()
-    quiet_ok >> cap_ok >> cool_ok >> trigger >> advance
+    threshold >> trigger
 
 
 snelnieuws_notifications_prod()
 snelnieuws_notifications_sandbox()
 snelnieuws_notifications_broadcast_manual()
-snelnieuws_notifications_auto_watcher()
+snelnieuws_notifications_slots()
