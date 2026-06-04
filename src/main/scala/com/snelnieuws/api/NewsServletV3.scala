@@ -550,7 +550,12 @@ class NewsServletV3(
       content     = row.content,
       category    = row.category,
       country     = row.country,
-      is_local    = row.isLocal,
+      // Intentionally always false on the wire: the apps render a "Local"
+      // pill whenever is_local is true, and we don't want that badge shown.
+      // The real locality flag (row.isLocal) is still computed and used
+      // server-side to drive the 3:1 local-first blend + foreign-local
+      // down-rank — this only suppresses the client-facing badge.
+      is_local    = false,
       language    = row.language
     )
 

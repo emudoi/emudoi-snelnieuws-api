@@ -160,7 +160,7 @@ class NewsServletV3Spec
       }
     }
 
-    "country labels is_local but never filters articles out (NULL-country rows still appear)" in {
+    "country never filters articles out; is_local is suppressed on the wire" in {
       requireDb()
       wipeAllArticles()
       val nlPrimary = insertV3(title = s"$v3Tag-primary-nl", country = Some("nl"))
@@ -179,11 +179,10 @@ class NewsServletV3Spec
         byId.keySet should contain allOf (
           nlPrimary.toString, beShared.toString, deOnly.toString, noCountry.toString
         )
-        // is_local labeling matches the request country.
-        byId(nlPrimary.toString) shouldBe true
-        byId(beShared.toString)  shouldBe true   // request country is in shared_countries
-        byId(deOnly.toString)    shouldBe false
-        byId(noCountry.toString) shouldBe false  // NULL country resolves via COALESCE
+        // is_local is intentionally suppressed on the wire (always false) so the
+        // apps never render the "Local" badge. Locality is still computed and
+        // used server-side for ordering — it's just not exposed. See toApi.
+        all (byId.values) shouldBe false
       }
     }
 
@@ -264,7 +263,7 @@ class NewsServletV3Spec
       }
     }
 
-    "is_local=true when article.country == request.country" in {
+    "is_local is suppressed on the wire even when country matches" in {
       requireDb()
       wipeAllArticles()
       val nlPrimary = insertV3(title = s"$v3Tag-local", country = Some("nl"))
@@ -274,12 +273,11 @@ class NewsServletV3Spec
         status shouldBe 200
         val parsed   = org.json4s.jackson.parseJson(body)
         val articles = (parsed \ "articles").children
+        // Both locally match nl, but the wire flag is suppressed (no badge).
         articles.find(a => (a \ "id").extract[String] == nlPrimary.toString)
-          .map(a => (a \ "is_local").extract[Boolean]) shouldBe Some(true)
-        // Shared-country article is also is_local (the request country is in
-        // its shared_countries) — the spec defines is_local as either match.
+          .map(a => (a \ "is_local").extract[Boolean]) shouldBe Some(false)
         articles.find(a => (a \ "id").extract[String] == beShared.toString)
-          .map(a => (a \ "is_local").extract[Boolean]) shouldBe Some(true)
+          .map(a => (a \ "is_local").extract[Boolean]) shouldBe Some(false)
       }
     }
 
@@ -345,14 +343,14 @@ class NewsServletV3Spec
   }
 
   "GET /v3/articles/:id" should {
-    "return the single article with is_local set" in {
+    "return the single article with is_local suppressed (false) on the wire" in {
       requireDb()
       wipeAllArticles()
       val id = insertV3(title = s"$v3Tag-by-id", country = Some("nl"))
       get(s"/v3/articles/$id", Map("country" -> "nl"), gatedHeaders) {
         status shouldBe 200
         field[String](body, "id") shouldBe Some(id.toString)
-        field[Boolean](body, "is_local") shouldBe Some(true)
+        field[Boolean](body, "is_local") shouldBe Some(false)
       }
     }
 
