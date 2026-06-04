@@ -37,7 +37,11 @@ class ArticleService(
   featureFlagRepository: FeatureFlagRepository,
   imageCacheService: ImageCacheService,
   imageDownloadWorker: ImageDownloadWorker,
-  publicBaseUrl: String
+  publicBaseUrl: String,
+  // Backing repo for the eulang_articles table. Optional so existing
+  // callers/tests construct unchanged; when None (or the kill-switch flag
+  // is off) the v3 feed behaves exactly as before — articles only.
+  eulangRepository: Option[ArticleRepository] = None
 ) {
 
   import ArticleService._
@@ -178,30 +182,80 @@ class ArticleService(
     * `personalisedV3Available(clientId)`; if the check fails this
     * method returns the underlying findV3 result unchanged so
     * mis-ordered callers still get correct data. */
+  /** Build the v3 read pool. When the eulang blend kill-switch is off (or
+    * no eulang repo is wired) this is just `articles` ordered by
+    * published_at DESC — identical to the pre-blend behaviour. When on, the
+    * articles pool is merged with the eulang_articles pool (eulang ids
+    * offset so they never collide), split by `is_local` (request-country
+    * match), and interleaved `localPer : otherPer` (default 3:1). Once the
+    * local bucket drains the rest of `other` is appended, and vice-versa.
+    *
+    * Eulang is best-effort: if its pool query fails we log and fall back to
+    * articles-only, so the eulang track can never take the feed down. */
+  def blendedV3Pool(
+    country: String,
+    language: String,
+    categories: List[String],
+    localPer: Int = DefaultLocalPerCycle,
+    otherPer: Int = DefaultOtherPerCycle
+  ): Either[Throwable, List[SourcedArticleV3]] =
+    repository.findV3Pool(country, language, categories).map { mainPool =>
+      val main = mainPool.map(SourcedArticleV3(_, eulang = false))
+      val blendOn =
+        eulangRepository.isDefined &&
+          featureFlagRepository.isEnabled(EulangBlendFlag).getOrElse(false)
+      if (!blendOn) main
+      else {
+        // Best-effort: eulang failure degrades to articles-only so the
+        // eulang track can never take the feed down.
+        val eulang = eulangRepository.get
+          .findV3Pool(country, language, categories) match {
+          case Right(rows) => rows.map(SourcedArticleV3(_, eulang = true))
+          case Left(e) =>
+            logger.warn(s"eulang pool fetch failed; falling back to articles-only: ${e.getMessage}")
+            Nil
+        }
+        val combined = main ++ eulang
+        val (local, other) = combined.partition(_.row.isLocal)
+        // Re-sort each bucket: the two pools were each published_at-sorted,
+        // but the concatenation is not globally ordered.
+        val byRecency: SourcedArticleV3 => Long = s => -s.row.publishedAt.toInstant.toEpochMilli
+        blendBuckets(local.sortBy(byRecency), other.sortBy(byRecency), localPer, otherPer)
+      }
+    }
+
   def personalisedV3Fetch(
     clientId: Option[UUID],
     country: String,
     language: String,
     categories: List[String],
-    limit: Int
-  ): Either[Throwable, (List[ArticleV3Row], Boolean)] = {
+    limit: Int,
+    localPer: Int = DefaultLocalPerCycle,
+    otherPer: Int = DefaultOtherPerCycle
+  ): Either[Throwable, (List[SourcedArticleV3], Boolean)] = {
+    // Dedup key into the Long served_ids set: eulang rows are offset so they
+    // never collide with articles ids. This Long never leaves the service —
+    // the wire id is produced by encodePublicId at the gate.
+    def servedKey(s: SourcedArticleV3): Long =
+      if (s.eulang) s.row.id + EulangIdOffset else s.row.id
+
     val flagOn = featureFlagRepository.isEnabled(PersonalisedFeedFlag).getOrElse(false)
     (flagOn, clientId) match {
       case (true, Some(cid)) =>
         for {
-          pool   <- repository.findV3Pool(country, language, categories)
+          pool   <- blendedV3Pool(country, language, categories, localPer, otherPer)
           served <- appClientRepository.readServedIds(cid)
           result <- {
             val servedSet = served.toSet
-            val fresh = pool.filterNot(r => servedSet.contains(r.id)).take(limit)
+            val fresh = pool.filterNot(s => servedSet.contains(servedKey(s))).take(limit)
             if (fresh.nonEmpty) {
               logger.info(
                 s"personalised_v3 client=${hashClient(cid)} pool=${pool.length} " +
                   s"served=${served.size} fresh=${fresh.size} reset=false " +
                   s"language=$language country=$country cats=${categories.mkString(",")}"
               )
-              val hasMore = pool.count(r => !servedSet.contains(r.id)) > limit
-              appClientRepository.appendServedIds(cid, fresh.map(_.id))
+              val hasMore = pool.count(s => !servedSet.contains(servedKey(s))) > limit
+              appClientRepository.appendServedIds(cid, fresh.map(servedKey))
                 .map(_ => (fresh, hasMore))
             } else {
               // Exhaust path: reset and serve top `limit` from the
@@ -214,15 +268,17 @@ class ArticleService(
                   s"served=${served.size} fresh=0 reset=true " +
                   s"language=$language country=$country cats=${categories.mkString(",")}"
               )
-              appClientRepository.setServedIds(cid, reset.map(_.id))
+              appClientRepository.setServedIds(cid, reset.map(servedKey))
                 .map(_ => (reset, pool.length > limit))
             }
           }
         } yield result
       case _ =>
         // Defensive: caller should have routed elsewhere. Honour
-        // cursor=None first-page behaviour by delegating to findV3.
+        // cursor=None first-page behaviour by delegating to findV3 (all
+        // articles-table, so eulang=false).
         repository.findV3(country, language, categories, cursor = None, limit = limit)
+          .map { case (rows, more) => (rows.map(SourcedArticleV3(_, eulang = false)), more) }
     }
   }
 
@@ -315,6 +371,64 @@ class ArticleService(
 object ArticleService {
 
   private val PersonalisedFeedFlag = "personalised_feed_enabled"
+
+  // Kill switch for the eulang feed blender (V32 seed). Off → feed is
+  // articles-only, exactly as before.
+  private val EulangBlendFlag = "eulang_blend_enabled"
+
+  // INTERNAL dedup discriminator only — never sent to clients. The served_ids
+  // rotation set is Set[Long] and is shared with the v1/v2 personalised paths,
+  // so we must NOT change its type. But articles.id and eulang_articles.id are
+  // both BIGSERIAL from 1, so a raw id would collide across tables in that set.
+  // We key eulang rows in served_ids as rawId + EulangIdOffset to keep them
+  // distinct, while the *wire* id is the readable "e{rawId}" produced at the
+  // controller gate (encodePublicId). 10^12 is far above any realistic
+  // articles.id, so main-table keys never reach into the eulang range.
+  val EulangIdOffset: Long = 1000000000000L
+
+  // Default feed blend ratio: 3 local (country-match) : 1 other.
+  val DefaultLocalPerCycle = 3
+  val DefaultOtherPerCycle = 1
+
+  /** A v3 row tagged with the table it came from. The id inside `row` stays
+    * the raw per-table BIGSERIAL; the eulang/articles distinction is carried
+    * here and only turned into a namespaced id at the controller gate. */
+  case class SourcedArticleV3(row: ArticleV3Row, eulang: Boolean)
+
+  /** Gate encoder: the client-facing id. Eulang rows become "e{rawId}";
+    * articles keep their plain numeric string (unchanged, so existing saved
+    * ids / deep links keep working). */
+  def encodePublicId(eulang: Boolean, rawId: Long): String =
+    if (eulang) s"e$rawId" else rawId.toString
+
+  /** Gate decoder for GET /v3/articles/:id. Returns (eulang, rawId) or None
+    * when the id is malformed. "e123" → (true, 123); "123" → (false, 123). */
+  def decodePublicId(public: String): Option[(Boolean, Long)] = {
+    val (eulang, digits) = if (public.startsWith("e")) (true, public.drop(1)) else (false, public)
+    scala.util.Try(digits.toLong).toOption.map((eulang, _))
+  }
+
+  /** Interleave two already-ordered lists, emitting up to `localPer` from
+    * `local` then up to `otherPer` from `other`, repeating. When one list
+    * empties, the remainder of the other is appended in order. Both per-
+    * cycle counts are clamped to >= 1 so the loop always makes progress. */
+  private[service] def blendBuckets[A](
+    local: List[A],
+    other: List[A],
+    localPer: Int,
+    otherPer: Int
+  ): List[A] = {
+    val lp = math.max(localPer, 1)
+    val op = math.max(otherPer, 1)
+    val out = List.newBuilder[A]
+    var l = local
+    var o = other
+    while (l.nonEmpty || o.nonEmpty) {
+      val (lh, lt) = l.splitAt(lp); out ++= lh; l = lt
+      val (oh, ot) = o.splitAt(op); out ++= oh; o = ot
+    }
+    out.result()
+  }
 
   /** SHA-256 prefix of the install UUID, used only in log lines so production
     * logs don't contain raw install IDs. 4 bytes (8 hex chars) is enough to

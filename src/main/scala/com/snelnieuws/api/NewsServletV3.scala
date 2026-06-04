@@ -41,7 +41,11 @@ class NewsServletV3(
     * path with no host. */
   imagesPublicBaseUrl: String,
   semanticQueryService: SemanticQueryService,
-  ingestionApiClient: IngestionApiClient
+  ingestionApiClient: IngestionApiClient,
+  // Backing repo for eulang_articles, used to route GET /v3/articles/:id
+  // for blended eulang items (id >= ArticleService.EulangIdOffset). Optional
+  // so test harnesses construct unchanged; None → behaves articles-only.
+  eulangArticleRepository: Option[com.snelnieuws.repository.ArticleRepository] = None
 ) extends ScalatraServlet
     with JacksonJsonSupport {
 
@@ -149,17 +153,30 @@ class NewsServletV3(
     // routing — when the v3 migration shipped (commit 67c4a89) it
     // called findV3 directly, accidentally cutting v3 off from the
     // server-side served-id tracking.
+    // Feed blend ratio: local (country-match) items per 1 other, default 3
+    // (→ 3:1). Clamped 1..20. Only meaningful when the eulang blend is on.
+    val localPer = params.get("ratio")
+      .flatMap(s => Try(s.toInt).toOption)
+      .map(n => math.min(math.max(n, 1), 20))
+      .getOrElse(ArticleService.DefaultLocalPerCycle)
+
     val cidOpt = clientIdFromHeader().toOption
-    val result: Either[Throwable, (List[ArticleV3Row], Boolean)] =
+    val result: Either[Throwable, (List[ArticleService.SourcedArticleV3], Boolean)] =
       if (articleService.personalisedV3Available(cidOpt)) {
-        articleService.personalisedV3Fetch(cidOpt, country, language, categories, limit)
+        articleService.personalisedV3Fetch(
+          cidOpt, country, language, categories, limit,
+          localPer = localPer, otherPer = ArticleService.DefaultOtherPerCycle
+        )
       } else {
+        // Legacy path is articles-only (eulang=false); wrap so the response
+        // mapping is uniform.
         articleRepository.findV3(country, language, categories, cursorOpt, limit)
+          .map { case (rows, more) => (rows.map(ArticleService.SourcedArticleV3(_, eulang = false)), more) }
       }
 
     result match {
       case Right((rows, hasMore)) =>
-        val articles = rows.map(toApi)
+        val articles = rows.map(toApiSourced)
         // Cursor is meaningful ONLY on the legacy path. The
         // personalised path uses the served_ids set; sending a
         // next_cursor there would invite the client to paginate
@@ -167,7 +184,7 @@ class NewsServletV3(
         // the "call /v3/feed again, get fresh content" rhythm.
         val nextCursor =
           if (!articleService.personalisedV3Available(cidOpt) && hasMore && rows.nonEmpty) {
-            val last = rows.last
+            val last = rows.last.row
             Some(CursorCodec.encode(last.publishedAt.toInstant, last.id))
           } else None
         PaginatedArticlesResponseV3(
@@ -191,12 +208,23 @@ class NewsServletV3(
         case Left(msg) =>
           BadRequest(Map("error" -> msg))
         case Right(language) =>
-          Try(params("id").toLong).toOption match {
+          // Decode the gate id: "e123" → eulang_articles, "123" → articles.
+          // The raw id is what the repos query; the namespaced id only ever
+          // exists at this boundary.
+          ArticleService.decodePublicId(params("id")) match {
             case None =>
-              BadRequest(Map("error" -> s"Invalid ID format: '${params("id")}' — expected a number"))
-            case Some(id) =>
-              articleRepository.findV3ById(country, language, id) match {
-                case Right(Some(row)) => toApi(row)
+              BadRequest(Map("error" -> s"Invalid ID format: '${params("id")}'"))
+            case Some((isEulang, rawId)) =>
+              val lookup: Either[Throwable, Option[ArticleV3Row]] =
+                if (isEulang)
+                  eulangArticleRepository
+                    .map(_.findV3ById(country, language, rawId))
+                    .getOrElse(Right(None))
+                else
+                  articleRepository.findV3ById(country, language, rawId)
+              lookup match {
+                case Right(Some(row)) =>
+                  toApiSourced(ArticleService.SourcedArticleV3(row, eulang = isEulang))
                 case Right(None)      => NotFound(Map("error" -> "Article not found"))
                 case Left(e) =>
                   InternalServerError(Map("error" -> s"Failed to load article: ${e.getMessage}"))
@@ -502,6 +530,13 @@ class NewsServletV3(
 
   private val publishedAtFmt: DateTimeFormatter =
     DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'").withZone(ZoneOffset.UTC)
+
+  /** Encode a sourced row for the wire: eulang items get the "e{id}"
+    * namespaced id (so they round-trip to the eulang table on detail
+    * fetch); articles are unchanged. The id transform lives only here at
+    * the gate — the rest of the system works on raw per-table ids. */
+  private def toApiSourced(s: ArticleService.SourcedArticleV3): ArticleV3 =
+    toApi(s.row).copy(id = ArticleService.encodePublicId(s.eulang, s.row.id))
 
   private def toApi(row: ArticleV3Row): ArticleV3 =
     ArticleV3(

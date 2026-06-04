@@ -229,7 +229,8 @@ class Components(
       featureFlagRepository = featureFlagRepository,
       imageCacheService     = imageCacheService,
       imageDownloadWorker   = imageDownloadWorker,
-      publicBaseUrl         = imagesPublicBaseUrl
+      publicBaseUrl         = imagesPublicBaseUrl,
+      eulangRepository      = Some(eulangArticleRepository)
     )
 
   // ── Per-language candidate pool. Shared across iOS + Android since
@@ -411,7 +412,8 @@ class Components(
       firebaseVerifier,
       imagesPublicBaseUrl,
       semanticQueryService,
-      ingestionApiClient
+      ingestionApiClient,
+      eulangArticleRepository = Some(eulangArticleRepository)
     )
   lazy val notificationDispatchServlet: NotificationDispatchServlet =
     new NotificationDispatchServlet(
