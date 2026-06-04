@@ -343,12 +343,27 @@ class Components(
   }
 
   // Servlets
+  // Read-only ArticleService bound to eulang_articles. Used by v1
+  // /articles/:id to resolve "e<id>" share ids (link-preview crawlers hit
+  // the public, unauthenticated v1 endpoint). Reuses the same read-time
+  // image absolutising as the main service.
+  lazy val eulangArticleService: ArticleService =
+    new ArticleService(
+      repository            = eulangArticleRepository,
+      appClientRepository   = appClientRepository,
+      featureFlagRepository = featureFlagRepository,
+      imageCacheService     = imageCacheService,
+      imageDownloadWorker   = imageDownloadWorker,
+      publicBaseUrl         = imagesPublicBaseUrl
+    )
+
   lazy val newsServlet: NewsServlet =
     new NewsServlet(
       articleService,
       notificationService,
       userService,
-      firebaseVerifier
+      firebaseVerifier,
+      eulangArticleService = Some(eulangArticleService)
     )
   lazy val newsServletV2: NewsServletV2 =
     new NewsServletV2(

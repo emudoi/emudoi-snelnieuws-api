@@ -18,7 +18,12 @@ class NewsServlet(
   articleService: ArticleService,
   notificationService: NotificationService,
   userService: UserService,
-  firebaseVerifier: FirebaseTokenVerifier
+  firebaseVerifier: FirebaseTokenVerifier,
+  // Read-only service bound to eulang_articles, used to resolve "e<id>"
+  // share ids on GET /articles/:id (the public meta endpoint link-preview
+  // crawlers hit). Optional so existing callers/tests construct unchanged;
+  // when None, "e<id>" ids resolve to nothing (404).
+  eulangArticleService: Option[ArticleService] = None
 ) extends ScalatraServlet
     with JacksonJsonSupport {
 
@@ -75,19 +80,22 @@ class NewsServlet(
     }
   }
 
-  // GET /articles/:id
+  // GET /articles/:id — also serves link-preview (Open Graph) metadata to
+  // the redirect service. Accepts both plain numeric ids (articles table)
+  // and "e<id>" share ids for eulang articles, mirroring v3's routing so
+  // shared eulang links resolve a title/description/image.
   get("/articles/:id") {
-    try {
-      val id = params("id").toLong
-      articleService.findById(id) match {
-        case Right(Some(article)) => article
-        case Right(None)          => NotFound(Map("error" -> "Article not found"))
-        case Left(e) =>
-          InternalServerError(Map("error" -> s"Failed to load article: ${e.getMessage}"))
-      }
-    } catch {
-      case _: NumberFormatException =>
-        BadRequest(Map("error" -> s"Invalid ID format: '${params("id")}' — expected a number"))
+    ArticleService.decodePublicId(params("id")) match {
+      case None =>
+        BadRequest(Map("error" -> s"Invalid ID format: '${params("id")}'"))
+      case Some((isEulang, rawId)) =>
+        val svc = if (isEulang) eulangArticleService.getOrElse(articleService) else articleService
+        svc.findById(rawId) match {
+          case Right(Some(article)) => article
+          case Right(None)          => NotFound(Map("error" -> "Article not found"))
+          case Left(e) =>
+            InternalServerError(Map("error" -> s"Failed to load article: ${e.getMessage}"))
+        }
     }
   }
 
