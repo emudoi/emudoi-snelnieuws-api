@@ -313,7 +313,7 @@ class ArticleRepository(
       val q = fr"""
         SELECT id, author, title, description, url, url_to_image,
                published_at, content, category, country,
-               COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
+               COALESCE(LOWER(country) = $country OR $country = ANY(ARRAY(SELECT LOWER(sc) FROM unnest(shared_countries) AS sc)), FALSE) AS is_local,
                language
         FROM $table
         WHERE language = $language
@@ -372,7 +372,7 @@ class ArticleRepository(
       val baseSelect = fr"""
         SELECT id, author, title, description, url, url_to_image,
                published_at, content, category, country,
-               COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
+               COALESCE(LOWER(country) = $country OR $country = ANY(ARRAY(SELECT LOWER(sc) FROM unnest(shared_countries) AS sc)), FALSE) AS is_local,
                language
         FROM $table
         WHERE language = $language
@@ -436,7 +436,7 @@ class ArticleRepository(
       val baseSelect = fr"""
         SELECT id, author, title, description, url, url_to_image,
                published_at, content, category, country,
-               COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
+               COALESCE(LOWER(country) = $country OR $country = ANY(ARRAY(SELECT LOWER(sc) FROM unnest(shared_countries) AS sc)), FALSE) AS is_local,
                language
         FROM $table
         WHERE language = $language
@@ -479,7 +479,7 @@ class ArticleRepository(
           sql"""
             SELECT id, author, title, description, url, url_to_image,
                    published_at, content, category, country,
-                   COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
+                   COALESCE(LOWER(country) = $country OR $country = ANY(ARRAY(SELECT LOWER(sc) FROM unnest(shared_countries) AS sc)), FALSE) AS is_local,
                    language
             FROM $table
             WHERE url = ANY($urls)
@@ -502,7 +502,7 @@ class ArticleRepository(
         sql"""
           SELECT id, author, title, description, url, url_to_image,
                  published_at, content, category, country,
-                 COALESCE(country = $country OR $country = ANY(shared_countries), FALSE) AS is_local,
+                 COALESCE(LOWER(country) = $country OR $country = ANY(ARRAY(SELECT LOWER(sc) FROM unnest(shared_countries) AS sc)), FALSE) AS is_local,
                  language
           FROM $table
           WHERE id = $id AND language = $language

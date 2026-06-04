@@ -216,11 +216,20 @@ class ArticleService(
             Nil
         }
         val combined = main ++ eulang
-        val (local, other) = combined.partition(_.row.isLocal)
         // Re-sort each bucket: the two pools were each published_at-sorted,
         // but the concatenation is not globally ordered.
         val byRecency: SourcedArticleV3 => Long = s => -s.row.publishedAt.toInstant.toEpochMilli
-        blendBuckets(local.sortBy(byRecency), other.sortBy(byRecency), localPer, otherPer)
+        // Three-way classification relative to the request country:
+        //   local        — country = me OR me ∈ shared_countries (is_local)
+        //   global       — no specific country (NULL/blank) → internationally
+        //                  relevant, kept as the "other" lane in the blend
+        //   foreign-local— a specific *other* country, not shared with me →
+        //                  down-ranked to the tail (still served, but only
+        //                  after local + global), never displacing them.
+        val (local, nonLocal)      = combined.partition(_.row.isLocal)
+        val (global, foreignLocal) = nonLocal.partition(_.row.country.forall(_.trim.isEmpty))
+        blendBuckets(local.sortBy(byRecency), global.sortBy(byRecency), localPer, otherPer) ++
+          foreignLocal.sortBy(byRecency)
       }
     }
 
