@@ -7,6 +7,7 @@ import doobie._
 import doobie.implicits._
 import doobie.hikari.HikariTransactor
 import doobie.postgres.implicits._
+import io.circe.Json
 import org.slf4j.LoggerFactory
 
 import java.time.{Instant, OffsetDateTime, ZoneOffset}
@@ -22,7 +23,13 @@ class EventRepository(provideTransactor: => HikariTransactor[IO]) {
 
   private type Row =
     (UUID, String, Option[String], Option[Long], Option[Int],
-     Option[String], Option[String], Option[String], Option[OffsetDateTime])
+     Option[String], Option[String], Option[String], Option[OffsetDateTime],
+     Option[String], Option[String], Option[String])
+
+  private def propsJson(p: Option[Map[String, String]]): Option[String] =
+    p.map(_.filter { case (k, v) => k.trim.nonEmpty && v.trim.nonEmpty })
+      .filter(_.nonEmpty)
+      .map(m => Json.fromFields(m.map { case (k, v) => k -> Json.fromString(v) }).noSpaces)
 
   private def parseTs(s: Option[String]): Option[OffsetDateTime] =
     s.map(_.trim).filter(_.nonEmpty).flatMap { v =>
@@ -48,15 +55,19 @@ class EventRepository(provideTransactor: => HikariTransactor[IO]) {
           clip(e.list, 64),
           clip(e.country, 8),
           clip(e.language, 8),
-          parseTs(e.ts)
+          parseTs(e.ts),
+          clip(e.category, 64),
+          clip(e.source, 128),
+          propsJson(e.props)
         )
       }
     if (rows.isEmpty) return Right(0)
 
     val sql =
       """INSERT INTO user_events
-           (client_id, event_type, article_id, dwell_ms, position, list_name, country, language, event_ts)
-         VALUES (?,?,?,?,?,?,?,?,?)"""
+           (client_id, event_type, article_id, dwell_ms, position, list_name, country, language, event_ts,
+            category, source, props)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?::jsonb)"""
     try
       Right(Update[Row](sql).updateMany(rows).transact(transactor).unsafeRunSync())
     catch {
