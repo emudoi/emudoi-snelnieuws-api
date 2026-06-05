@@ -1,7 +1,7 @@
 package com.snelnieuws.api
 
 import com.snelnieuws.auth.FirebaseTokenVerifier
-import com.snelnieuws.model.{ArticleV3Row, Categories, CategoryNames, EmbedQueryRequest, Languages, UiStrings}
+import com.snelnieuws.model.{ArticleV3Row, Categories, CategoryNames, EmbedQueryRequest, Languages, UiStrings, UserEvent, UserEventsBatch}
 import com.snelnieuws.repository.AppClientRepository
 import com.snelnieuws.model.ArticleV3Row
 import com.snelnieuws.service.{ArticleService, IngestionApiClient, IngestionApiError, NotificationService, SemanticQueryService, UserService}
@@ -45,7 +45,10 @@ class NewsServletV3(
   // Backing repo for eulang_articles, used to route GET /v3/articles/:id
   // for blended eulang items (id >= ArticleService.EulangIdOffset). Optional
   // so test harnesses construct unchanged; None → behaves articles-only.
-  eulangArticleRepository: Option[com.snelnieuws.repository.ArticleRepository] = None
+  eulangArticleRepository: Option[com.snelnieuws.repository.ArticleRepository] = None,
+  // First-party engagement-event sink (POST /v3/events). Optional so test
+  // harnesses construct unchanged; None → the endpoint accepts and no-ops.
+  eventRepository: Option[com.snelnieuws.repository.EventRepository] = None
 ) extends ScalatraServlet
     with JacksonJsonSupport {
 
@@ -341,6 +344,31 @@ class NewsServletV3(
             case Left(e) =>
               logger.error(s"embed bridge failed: ${e.getMessage}", e)
               InternalServerError(Map("error" -> e.getMessage))
+          }
+        }
+    }
+  }
+
+  // First-party engagement events. The apps batch impression/open/close/
+  // read_engaged/swipe/share events and flush them here; client_id comes from
+  // the X-Client-Key gate. Stored real-time in user_events (Phase 1). Best-
+  // effort: unknown event types are dropped, and the call still 200s.
+  post("/events") {
+    clientIdFromHeader() match {
+      case Left(msg)       => BadRequest(Map("error" -> msg))
+      case Right(clientId) =>
+        val events = Try(parsedBody.extract[UserEventsBatch]).toOption.map(_.events).getOrElse(Nil)
+        if (events.isEmpty) {
+          BadRequest(Map("error" -> "events must be a non-empty array"))
+        } else if (events.size > UserEvent.MaxBatchSize) {
+          BadRequest(Map("error" -> s"too many events (max ${UserEvent.MaxBatchSize})"))
+        } else {
+          eventRepository.map(_.insertBatch(clientId, events)) match {
+            case Some(Right(n)) => Map("accepted" -> n)
+            case None           => Map("accepted" -> 0) // sink not wired (tests)
+            case Some(Left(e)) =>
+              logger.error(s"Failed to record events: ${e.getMessage}", e)
+              InternalServerError(Map("error" -> "failed to record events"))
           }
         }
     }

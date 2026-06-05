@@ -21,6 +21,7 @@ import com.snelnieuws.repository.{
   AndroidNotificationSubscriptionRepository,
   AppClientRepository,
   ArticleRepository,
+  EventRepository,
   FeatureFlagRepository,
   ImageCacheRepository,
   NotificationCandidateRepository,
@@ -88,6 +89,8 @@ class Components(
     new ImageCacheRepository(provideTransactor)
   lazy val featureFlagRepository: FeatureFlagRepository =
     new FeatureFlagRepository(provideTransactor)
+  lazy val eventRepository: EventRepository =
+    new EventRepository(provideTransactor)
 
   // Image cache config — single source of truth read once on construct.
   private val imagesCfg = rootConfig.getConfig("images")
@@ -428,7 +431,8 @@ class Components(
       imagesPublicBaseUrl,
       semanticQueryService,
       ingestionApiClient,
-      eulangArticleRepository = Some(eulangArticleRepository)
+      eulangArticleRepository = Some(eulangArticleRepository),
+      eventRepository = Some(eventRepository)
     )
   lazy val notificationDispatchServlet: NotificationDispatchServlet =
     new NotificationDispatchServlet(
