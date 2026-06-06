@@ -495,7 +495,12 @@ class ArticleRepository(
           Left(e)
       }
 
-  /** Single-article fetch with the same v3 projection (including `is_local`). */
+  /** Single-article fetch with the same v3 projection (including `is_local`).
+    * Deliberately does NOT filter by language: the feed filters by language,
+    * but a directly-requested article (shared link / deep link) must open
+    * regardless of the caller's app language — otherwise a Dutch (eulang)
+    * share would 404 for an English user. `language` is kept in the signature
+    * for logging/back-compat only. */
   def findV3ById(country: String, language: String, id: Long): Either[Throwable, Option[ArticleV3Row]] =
     try
       Right(
@@ -505,7 +510,7 @@ class ArticleRepository(
                  COALESCE(LOWER(country) = $country OR $country = ANY(ARRAY(SELECT LOWER(sc) FROM unnest(shared_countries) AS sc)), FALSE) AS is_local,
                  language
           FROM $table
-          WHERE id = $id AND language = $language
+          WHERE id = $id
         """.query[ArticleV3Row].option.transact(transactor).unsafeRunSync()
       )
     catch {
