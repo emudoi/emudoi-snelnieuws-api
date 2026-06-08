@@ -21,11 +21,13 @@ import com.snelnieuws.repository.{
   AndroidNotificationSubscriptionRepository,
   AppClientRepository,
   ArticleRepository,
+  ArticleTrendingScoresRepository,
   EventRepository,
   FeatureFlagRepository,
   ImageCacheRepository,
   NotificationCandidateRepository,
   NotificationSubscriptionRepository,
+  SeoTrendsRepository,
   UserRepository,
   UserSemanticQueryRepository
 }
@@ -50,7 +52,10 @@ import com.snelnieuws.service.{
   NotificationService,
   PushyApnsMessagingService,
   SemanticQueryService,
+  SeoTrendsCleanupScheduler,
+  SeoTrendsConsumer,
   SummarizedArticleConsumer,
+  TrendingScoreService,
   UserService
 }
 import com.typesafe.config.{Config, ConfigFactory}
@@ -91,6 +96,11 @@ class Components(
     new FeatureFlagRepository(provideTransactor)
   lazy val eventRepository: EventRepository =
     new EventRepository(provideTransactor)
+  // Trending-search ranking: raw trend batches + per-article boost scores.
+  lazy val seoTrendsRepository: SeoTrendsRepository =
+    new SeoTrendsRepository(provideTransactor)
+  lazy val articleTrendingScoresRepository: ArticleTrendingScoresRepository =
+    new ArticleTrendingScoresRepository(provideTransactor)
 
   // Image cache config — single source of truth read once on construct.
   private val imagesCfg = rootConfig.getConfig("images")
@@ -233,7 +243,8 @@ class Components(
       imageCacheService     = imageCacheService,
       imageDownloadWorker   = imageDownloadWorker,
       publicBaseUrl         = imagesPublicBaseUrl,
-      eulangRepository      = Some(eulangArticleRepository)
+      eulangRepository      = Some(eulangArticleRepository),
+      articleTrendingScoresRepository = Some(articleTrendingScoresRepository)
     )
 
   // ── Per-language candidate pool. Shared across iOS + Android since
@@ -344,6 +355,55 @@ class Components(
       None
     }
   }
+
+  // Trending-search scorer — matches the latest trend batch against the
+  // last-48h articles + eulang_articles via the ingestion-api/Milvus bridge
+  // and writes article_trending_scores. Driven by SeoTrendsConsumer per batch.
+  lazy val trendingScoreService: TrendingScoreService =
+    new TrendingScoreService(
+      seoTrendsRepository             = seoTrendsRepository,
+      articleTrendingScoresRepository = articleTrendingScoresRepository,
+      articleRepository               = articleRepository,
+      eulangArticleRepository         = eulangArticleRepository,
+      ingestionApiClient              = ingestionApiClient
+    )
+
+  lazy val seoTrendsConsumer: Option[SeoTrendsConsumer] = {
+    val kafkaCfg = SummarizedImportKafkaConfig.loadSeoTrends(rootConfig)
+    if (kafkaCfg.enabled) {
+      try Some(
+        new SeoTrendsConsumer(
+          seoTrendsRepository  = seoTrendsRepository,
+          trendingScoreService = trendingScoreService,
+          kafkaConfig          = kafkaCfg
+        )
+      )
+      catch {
+        case e: Exception =>
+          logger.error(s"Failed to construct seo-trends consumer: ${e.getMessage}", e)
+          None
+      }
+    } else {
+      logger.info("Seo-trends Kafka consumer is disabled (kafka.seo-trends-import.enabled=false)")
+      None
+    }
+  }
+
+  private val seoTrendsCleanupCfg = rootConfig.getConfig("seo-trends.cleanup")
+  lazy val seoTrendsCleanupScheduler: Option[SeoTrendsCleanupScheduler] =
+    if (seoTrendsCleanupCfg.getBoolean("enabled")) {
+      Some(
+        new SeoTrendsCleanupScheduler(
+          seoTrendsRepository             = seoTrendsRepository,
+          articleTrendingScoresRepository = articleTrendingScoresRepository,
+          retentionHours                  = seoTrendsCleanupCfg.getLong("retention-hours"),
+          intervalMinutes                 = seoTrendsCleanupCfg.getLong("interval-minutes")
+        )
+      )
+    } else {
+      logger.info("Seo-trends cleanup scheduler is disabled (seo-trends.cleanup.enabled=false)")
+      None
+    }
 
   // Servlets
   // Read-only ArticleService bound to eulang_articles. Used by v1
@@ -473,6 +533,8 @@ class Components(
     imageCacheCleanupScheduler.foreach(_.start())
     summarizedArticleConsumer.foreach(_.start())
     eulangArticleConsumer.foreach(_.start())
+    seoTrendsConsumer.foreach(_.start())
+    seoTrendsCleanupScheduler.foreach(_.start())
     imageRetrySlowConsumer.foreach(_.start())
   }
 
@@ -486,6 +548,8 @@ class Components(
     // can land on the topic before the consumer's poll loop exits.
     summarizedArticleConsumer.foreach(_.stop())
     eulangArticleConsumer.foreach(_.stop())
+    seoTrendsConsumer.foreach(_.stop())
+    seoTrendsCleanupScheduler.foreach(_.stop())
     imageDownloadWorker.stop()
     imageRetrySlowConsumer.foreach(_.stop())
     kafkaImageRetryProducer.close()

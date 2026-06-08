@@ -20,6 +20,12 @@ object SummarizedImportKafkaConfig {
   def loadEulang(config: Config = ConfigFactory.load()): SummarizedImportKafkaConfig =
     from(config.getConfig("kafka.eulang-import"))
 
+  /** SEO-trends import — the `kafka.seo-trends-import` block (topic
+    * seo.trends.collected, separate consumer group). Reuses this case-class
+    * shape; the consumer ignores the article-specific fields. */
+  def loadSeoTrends(config: Config = ConfigFactory.load()): SummarizedImportKafkaConfig =
+    from(config.getConfig("kafka.seo-trends-import"))
+
   private def from(kafka: Config): SummarizedImportKafkaConfig =
     SummarizedImportKafkaConfig(
       bootstrapServers = kafka.getString("bootstrap-servers"),

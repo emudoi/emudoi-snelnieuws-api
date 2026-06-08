@@ -330,6 +330,33 @@ class ArticleRepository(
         Left(e)
     }
 
+  /** Articles published on or after `since`, across all languages, for
+    * trending-term scoring (TrendingScoreService). Same ArticleV3Row shape as
+    * findRecentForTopStory but with NO language filter — trend matching is
+    * geo-scoped, not language-scoped, and the lexical/semantic match decides
+    * relevance. is_local is forced false (empty country placeholder); the
+    * scorer doesn't use it. */
+  def findPublishedSince(since: OffsetDateTime): Either[Throwable, List[ArticleV3Row]] =
+    try {
+      val country = "" // placeholder — scorer ignores is_local
+      val q = fr"""
+        SELECT id, author, title, description, url, url_to_image,
+               published_at, content, category, country,
+               COALESCE(LOWER(country) = $country OR $country = ANY(ARRAY(SELECT LOWER(sc) FROM unnest(shared_countries) AS sc)), FALSE) AS is_local,
+               language
+        FROM $table
+        WHERE published_at >= $since
+        ORDER BY published_at DESC, id DESC
+      """
+      Right(q.query[ArticleV3Row].to[List].transact(transactor).unsafeRunSync())
+    } catch {
+      case e: Exception =>
+        logger.error(
+          s"Failed to load articles published since $since: ${e.getMessage}", e
+        )
+        Left(e)
+    }
+
   /** Distinct non-null, non-empty categories that currently have at least one article. */
   def findDistinctCategories(): Either[Throwable, List[String]] =
     try

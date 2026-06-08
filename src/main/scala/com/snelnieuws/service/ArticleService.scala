@@ -1,6 +1,6 @@
 package com.snelnieuws.service
 
-import com.snelnieuws.repository.{AppClientRepository, ArticleRepository, FeatureFlagRepository}
+import com.snelnieuws.repository.{AppClientRepository, ArticleRepository, ArticleTrendingScoresRepository, FeatureFlagRepository}
 import com.snelnieuws.model.{Article, ArticleCreate, ArticleRow, ArticleV3Row}
 import org.slf4j.LoggerFactory
 
@@ -41,7 +41,13 @@ class ArticleService(
   // Backing repo for the eulang_articles table. Optional so existing
   // callers/tests construct unchanged; when None (or the kill-switch flag
   // is off) the v3 feed behaves exactly as before — articles only.
-  eulangRepository: Option[ArticleRepository] = None
+  eulangRepository: Option[ArticleRepository] = None,
+  // Trending-search boost store. Optional so existing callers/tests construct
+  // unchanged; when None (or the trending_boost_enabled flag is off, or the
+  // request country has no live rows) the feed passes Map.empty into
+  // blendedV3Pool — byScore reduces to pure recency, byte-for-byte the
+  // pre-boost feed.
+  articleTrendingScoresRepository: Option[ArticleTrendingScoresRepository] = None
 ) {
 
   import ArticleService._
@@ -197,7 +203,12 @@ class ArticleService(
     language: String,
     categories: List[String],
     localPer: Int = DefaultLocalPerCycle,
-    otherPer: Int = DefaultOtherPerCycle
+    otherPer: Int = DefaultOtherPerCycle,
+    // Trending boost per servedKey (eulang ids offset by EulangIdOffset).
+    // Empty (the default) ⇒ byScore == byRecency, so the feed is byte-for-byte
+    // the pre-boost recency ordering. Loaded by personalisedV3Fetch only when
+    // the trending_boost_enabled flag is on and the country has live rows.
+    trending: Map[Long, Double] = Map.empty
   ): Either[Throwable, List[SourcedArticleV3]] =
     repository.findV3Pool(country, language, categories).map { mainPool =>
       val main = mainPool.map(SourcedArticleV3(_, eulang = false))
@@ -216,9 +227,30 @@ class ArticleService(
             Nil
         }
         val combined = main ++ eulang
-        // Re-sort each bucket: the two pools were each published_at-sorted,
-        // but the concatenation is not globally ordered.
-        val byRecency: SourcedArticleV3 => Long = s => -s.row.publishedAt.toInstant.toEpochMilli
+        // Re-sort each bucket by the blended recency·trending score. The two
+        // pools were each published_at-sorted, but the concatenation is not
+        // globally ordered.
+        //
+        // score(s) = exp(-k·ageH) · (1 + Alpha·trend(s)) — recency is the
+        // backbone (exponential half-life decay), trending a bounded
+        // multiplicative lift that is zero when nothing matches. With an empty
+        // `trending` map, trend(s) is always 0, so score collapses to
+        // exp(-k·ageH), which is strictly monotonic-decreasing in age — i.e.
+        // the exact recency-desc ordering the old `byRecency` produced.
+        val Alpha     = 0.6
+        val HalfLifeH = 18.0
+        val WindowH   = 48.0
+        val k         = math.log(2) / HalfLifeH
+        val nowMs     = System.currentTimeMillis()
+        def key(s: SourcedArticleV3): Long =
+          if (s.eulang) s.row.id + EulangIdOffset else s.row.id
+        def ageH(s: SourcedArticleV3): Double =
+          (nowMs - s.row.publishedAt.toInstant.toEpochMilli) / 3600000.0
+        def trend(s: SourcedArticleV3): Double =
+          if (ageH(s) <= WindowH) trending.getOrElse(key(s), 0.0) else 0.0
+        def score(s: SourcedArticleV3): Double =
+          math.exp(-k * ageH(s)) * (1.0 + Alpha * trend(s))
+        val byScore: SourcedArticleV3 => Double = s => -score(s)
         // Three-way classification relative to the request country:
         //   local        — country = me OR me ∈ shared_countries (is_local)
         //   global       — no specific country (NULL/blank) → internationally
@@ -228,8 +260,8 @@ class ArticleService(
         //                  after local + global), never displacing them.
         val (local, nonLocal)      = combined.partition(_.row.isLocal)
         val (global, foreignLocal) = nonLocal.partition(_.row.country.forall(_.trim.isEmpty))
-        blendBuckets(local.sortBy(byRecency), global.sortBy(byRecency), localPer, otherPer) ++
-          foreignLocal.sortBy(byRecency)
+        blendBuckets(local.sortBy(byScore), global.sortBy(byScore), localPer, otherPer) ++
+          foreignLocal.sortBy(byScore)
       }
     }
 
@@ -248,11 +280,29 @@ class ArticleService(
     def servedKey(s: SourcedArticleV3): Long =
       if (s.eulang) s.row.id + EulangIdOffset else s.row.id
 
+    // Trending boost: load the geo's live score map only when the flag is on
+    // AND the request country is non-empty AND the store is wired. Any miss
+    // (flag off, blank country, no repo, load failure, no live rows) yields
+    // Map.empty → blendedV3Pool's byScore reduces to pure recency.
+    val trending: Map[Long, Double] =
+      if (
+        country.nonEmpty &&
+        articleTrendingScoresRepository.isDefined &&
+        featureFlagRepository.isEnabled(TrendingBoostFlag).getOrElse(false)
+      ) {
+        articleTrendingScoresRepository.get.loadForGeo(country) match {
+          case Right(m) => m
+          case Left(e) =>
+            logger.warn(s"trending scores load failed for country=$country; pure recency: ${e.getMessage}")
+            Map.empty[Long, Double]
+        }
+      } else Map.empty[Long, Double]
+
     val flagOn = featureFlagRepository.isEnabled(PersonalisedFeedFlag).getOrElse(false)
     (flagOn, clientId) match {
       case (true, Some(cid)) =>
         for {
-          pool   <- blendedV3Pool(country, language, categories, localPer, otherPer)
+          pool   <- blendedV3Pool(country, language, categories, localPer, otherPer, trending)
           served <- appClientRepository.readServedIds(cid)
           result <- {
             val servedSet = served.toSet
@@ -384,6 +434,11 @@ object ArticleService {
   // Kill switch for the eulang feed blender (V32 seed). Off → feed is
   // articles-only, exactly as before.
   private val EulangBlendFlag = "eulang_blend_enabled"
+
+  // Kill switch for the trending-search ranking boost (V37 seed). Off → feed
+  // passes Map.empty into blendedV3Pool, so byScore == byRecency (pure
+  // recency), byte-for-byte the pre-boost feed.
+  private val TrendingBoostFlag = "trending_boost_enabled"
 
   // INTERNAL dedup discriminator only — never sent to clients. The served_ids
   // rotation set is Set[Long] and is shared with the v1/v2 personalised paths,
