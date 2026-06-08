@@ -118,6 +118,13 @@ spec:
           env:
             - name: KAFKA_SUMMARIZED_IMPORT_ENABLED
               value: "true"
+            # Consume seo.trends.collected (produced by marketing-api) into the
+            # local 48h seo_trends table + score recent articles. The feed boost
+            # itself stays gated on the trending_boost_enabled DB flag, so this
+            # populates article_trending_scores without changing the feed until
+            # that flag is flipped.
+            - name: KAFKA_SEO_TRENDS_ENABLED
+              value: "true"
             # In-cluster DNS for the Kafka service (kafka/kafka.svc.cluster.local).
             # The default in application.conf was the pre-k3s node IP and no
             # longer resolves. Pure config, not a secret — kept in the manifest.
