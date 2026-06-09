@@ -53,6 +53,7 @@ import com.snelnieuws.service.{
   KafkaUserEventsProducer,
   NotificationService,
   PushyApnsMessagingService,
+  RecommenderClient,
   SemanticQueryService,
   SeoTrendsCleanupScheduler,
   SeoTrendsConsumer,
@@ -259,6 +260,13 @@ class Components(
     }
   }
 
+  // LinUCB recommender client (recommender Phase-5). Always constructed (it's
+  // just an HTTP client); the actual /rank call is gated by the
+  // recommender_enabled feature flag inside ArticleService, so this stays
+  // inert until the flag is flipped. base-url points at the in-cluster service.
+  lazy val recommenderClient: RecommenderClient =
+    new RecommenderClient(rootConfig.getString("recommender.base-url"))
+
   lazy val articleService: ArticleService =
     new ArticleService(
       repository            = articleRepository,
@@ -268,7 +276,8 @@ class Components(
       imageDownloadWorker   = imageDownloadWorker,
       publicBaseUrl         = imagesPublicBaseUrl,
       eulangRepository      = Some(eulangArticleRepository),
-      articleTrendingScoresRepository = Some(articleTrendingScoresRepository)
+      articleTrendingScoresRepository = Some(articleTrendingScoresRepository),
+      recommenderClient     = Some(recommenderClient)
     )
 
   // ── Per-language candidate pool. Shared across iOS + Android since

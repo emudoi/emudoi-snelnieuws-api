@@ -47,7 +47,12 @@ class ArticleService(
   // request country has no live rows) the feed passes Map.empty into
   // blendedV3Pool — byScore reduces to pure recency, byte-for-byte the
   // pre-boost feed.
-  articleTrendingScoresRepository: Option[ArticleTrendingScoresRepository] = None
+  articleTrendingScoresRepository: Option[ArticleTrendingScoresRepository] = None,
+  // LinUCB recommender (recommender Phase-5). Optional so existing callers/
+  // tests construct unchanged; when None (or the recommender_enabled flag is
+  // off) the feed keeps its recency/trending order. Any /rank error falls back
+  // to that order too, so the recommender is never a hard dependency.
+  recommenderClient: Option[RecommenderClient] = None
 ) {
 
   import ArticleService._
@@ -265,6 +270,34 @@ class ArticleService(
       }
     }
 
+  /** Reorder the candidate pool using the LinUCB recommender (Phase-5).
+    * No-op unless the recommender_enabled flag is on AND a client is wired.
+    * The recommender returns the candidates' public ids in its preferred
+    * order; any id it omits keeps its original relative position at the tail.
+    * On any failure (flag off, no client, timeout, non-2xx, empty result) the
+    * pool is returned unchanged — the recommender is never a hard dependency. */
+  private def maybeRerank(
+    clientId: UUID,
+    pool: List[SourcedArticleV3]
+  ): List[SourcedArticleV3] = {
+    val on = recommenderClient.isDefined &&
+      featureFlagRepository.isEnabled(RecommenderFlag).getOrElse(false)
+    if (!on || pool.isEmpty) pool
+    else {
+      def pid(s: SourcedArticleV3): String = encodePublicId(s.eulang, s.row.id)
+      val byId = pool.map(s => pid(s) -> s).toMap
+      recommenderClient.get.rank(clientId.toString, pool.map(pid)) match {
+        case Some(orderedIds) =>
+          val orderedSet = orderedIds.toSet
+          val ordered    = orderedIds.flatMap(byId.get)
+          val tail       = pool.filterNot(s => orderedSet.contains(pid(s)))
+          logger.info(s"recommender_rerank client=${hashClient(clientId)} pool=${pool.length} ranked=${ordered.length}")
+          ordered ++ tail
+        case None => pool
+      }
+    }
+  }
+
   def personalisedV3Fetch(
     clientId: Option[UUID],
     country: String,
@@ -303,17 +336,20 @@ class ArticleService(
       case (true, Some(cid)) =>
         for {
           pool   <- blendedV3Pool(country, language, categories, localPer, otherPer, trending)
+          // Recommender Phase-5: reorder the candidate pool per device when the
+          // flag is on; identity (== pool) when off or on any /rank failure.
+          ranked = maybeRerank(cid, pool)
           served <- appClientRepository.readServedIds(cid)
           result <- {
             val servedSet = served.toSet
-            val fresh = pool.filterNot(s => servedSet.contains(servedKey(s))).take(limit)
+            val fresh = ranked.filterNot(s => servedSet.contains(servedKey(s))).take(limit)
             if (fresh.nonEmpty) {
               logger.info(
-                s"personalised_v3 client=${hashClient(cid)} pool=${pool.length} " +
+                s"personalised_v3 client=${hashClient(cid)} pool=${ranked.length} " +
                   s"served=${served.size} fresh=${fresh.size} reset=false " +
                   s"language=$language country=$country cats=${categories.mkString(",")}"
               )
-              val hasMore = pool.count(s => !servedSet.contains(servedKey(s))) > limit
+              val hasMore = ranked.count(s => !servedSet.contains(servedKey(s))) > limit
               appClientRepository.appendServedIds(cid, fresh.map(servedKey))
                 .map(_ => (fresh, hasMore))
             } else {
@@ -321,14 +357,14 @@ class ArticleService(
               // pool. Rotation cycle restarts — the user sees the
               // most-recent articles again, but only because they've
               // genuinely caught up with the entire pool.
-              val reset = pool.take(limit)
+              val reset = ranked.take(limit)
               logger.info(
-                s"personalised_v3 client=${hashClient(cid)} pool=${pool.length} " +
+                s"personalised_v3 client=${hashClient(cid)} pool=${ranked.length} " +
                   s"served=${served.size} fresh=0 reset=true " +
                   s"language=$language country=$country cats=${categories.mkString(",")}"
               )
               appClientRepository.setServedIds(cid, reset.map(servedKey))
-                .map(_ => (reset, pool.length > limit))
+                .map(_ => (reset, ranked.length > limit))
             }
           }
         } yield result
@@ -439,6 +475,10 @@ object ArticleService {
   // passes Map.empty into blendedV3Pool, so byScore == byRecency (pure
   // recency), byte-for-byte the pre-boost feed.
   private val TrendingBoostFlag = "trending_boost_enabled"
+
+  // Kill switch for LinUCB recommender re-ranking (V40 seed). Off → the v3
+  // feed serves the recency/trending pool unchanged.
+  private val RecommenderFlag = "recommender_enabled"
 
   // INTERNAL dedup discriminator only — never sent to clients. The served_ids
   // rotation set is Set[Long] and is shared with the v1/v2 personalised paths,
