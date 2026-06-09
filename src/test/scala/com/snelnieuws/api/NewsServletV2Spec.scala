@@ -274,11 +274,10 @@ class NewsServletV2Spec
       get("/v2/categories", Map.empty[String, String], gatedHeaders) {
         status shouldBe 200
         val list = (org.json4s.jackson.parseJson(body) \ "categories").extract[List[String]]
-        list shouldBe List(
-          "politics", "economy", "business", "finance", "technology", "science",
-          "health", "sports", "culture", "environment", "world",
-          "local", "other"
-        )
+        // Assert against the source of truth (Categories.all) so this can't go
+        // stale again when the snelmind taxonomy is expanded — the previous
+        // hardcoded 13-item literal drifted when the list grew to 21 (3aab6fb).
+        list shouldBe com.snelnieuws.model.Categories.all.toList
       }
     }
 

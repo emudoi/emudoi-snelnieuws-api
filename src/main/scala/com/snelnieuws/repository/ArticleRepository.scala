@@ -2,7 +2,7 @@ package com.snelnieuws.repository
 
 import cats.effect.IO
 import cats.effect.unsafe.implicits.global
-import com.snelnieuws.model.{ArticleCreate, ArticleRow, ArticleV3Row, SummarizedArticleExport}
+import com.snelnieuws.model.{ArticleCreate, ArticleRow, ArticleStamp, ArticleV3Row, SummarizedArticleExport}
 import doobie._
 import doobie.implicits._
 import doobie.hikari.HikariTransactor
@@ -545,6 +545,34 @@ class ArticleRepository(
         logger.error(s"Failed to load v3 article id=$id country=$country language=$language: ${e.getMessage}", e)
         Left(e)
     }
+
+  /** Batch fetch the minimal article snapshot used to stamp user_events at
+    * write time (recommender Phase-0). Keyed by raw per-table id; the caller
+    * has already decoded the eulang/articles distinction and routes ids to the
+    * right repository. Articles not found (e.g. already purged) are simply
+    * absent from the returned map. */
+  def findStampsByIds(ids: List[Long]): Either[Throwable, Map[Long, ArticleStamp]] =
+    if (ids.isEmpty) Right(Map.empty)
+    else
+      try
+        Right(
+          sql"""
+            SELECT id, title, url, category, author, country, language
+            FROM $table
+            WHERE id = ANY($ids)
+          """
+            .query[ArticleStamp]
+            .to[List]
+            .transact(transactor)
+            .unsafeRunSync()
+            .map(s => s.id -> s)
+            .toMap
+        )
+      catch {
+        case e: Exception =>
+          logger.error(s"Failed to load article stamps count=${ids.size}: ${e.getMessage}", e)
+          Left(e)
+      }
 
   /**
    * Insert-or-update an article keyed on `title`, using a summarized-article event

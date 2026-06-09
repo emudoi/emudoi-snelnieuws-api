@@ -1,8 +1,10 @@
 package com.snelnieuws.service
 
+import cats.effect.unsafe.implicits.global
 import com.snelnieuws.{DatabaseTestSupport, StubFcmMessagingService}
 import com.snelnieuws.db.Database
 import com.snelnieuws.model.{AndroidSubscribeRequest, ArticleCreate}
+import doobie.implicits._
 import com.snelnieuws.repository.{
   AndroidNotificationSubscriptionRepository,
   ArticleRepository,
@@ -75,6 +77,13 @@ class AndroidNotificationServiceSpec
       requireDb()
       val stub    = new StubFcmMessagingService(acceptAll = true)
       val service = newService(Some(stub))
+
+      // Establish the "no tokens at this frequency" precondition on the shared
+      // DB rather than assuming it — other suites leave Android subscriptions
+      // behind, and dispatch matches `frequency >= N` (a slot threshold), so a
+      // freq-3 dispatch also fans out to freq-4 subscribers. Clear freq >= 3.
+      sql"DELETE FROM android_notification_subscriptions WHERE frequency >= 3"
+        .update.run.transact(Database.transactor).unsafeRunSync()
 
       // A claimable "en" candidate must exist or dispatch returns
       // NoFreshTopStory; freq=3 has no subscribers so sent=0.

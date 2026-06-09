@@ -48,7 +48,11 @@ class NewsServletV3(
   eulangArticleRepository: Option[com.snelnieuws.repository.ArticleRepository] = None,
   // First-party engagement-event sink (POST /v3/events). Optional so test
   // harnesses construct unchanged; None → the endpoint accepts and no-ops.
-  eventRepository: Option[com.snelnieuws.repository.EventRepository] = None
+  eventRepository: Option[com.snelnieuws.repository.EventRepository] = None,
+  // Served-slate log (recommender Phase-0). Optional so test harnesses
+  // construct unchanged; None → feed serves are not logged. Best-effort: a
+  // logging failure never affects the feed response.
+  feedServeRepository: Option[com.snelnieuws.repository.FeedServeRepository] = None
 ) extends ScalatraServlet
     with JacksonJsonSupport {
 
@@ -180,6 +184,20 @@ class NewsServletV3(
     result match {
       case Right((rows, hasMore)) =>
         val articles = rows.map(toApiSourced)
+        // Recommender Phase-0: log the served slate (best-effort). The public
+        // ids here are exactly what the apps report back in user_events, so
+        // reward joins are direct. Never affects the response.
+        for {
+          repo <- feedServeRepository
+          cid  <- cidOpt
+          if articles.nonEmpty
+        } repo.logServe(
+          clientId = cid,
+          items    = articles.map(_.id),
+          listName = if (categories.isEmpty) None else Some(categories.mkString(",")),
+          country  = Some(country),
+          language = Some(language)
+        )
         // Cursor is meaningful ONLY on the legacy path. The
         // personalised path uses the served_ids set; sending a
         // next_cursor there would invite the client to paginate
