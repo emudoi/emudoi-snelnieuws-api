@@ -1,8 +1,10 @@
 package com.snelnieuws.service
 
+import cats.effect.unsafe.implicits.global
 import com.snelnieuws.{DatabaseTestSupport, StubApnsMessagingService}
 import com.snelnieuws.db.Database
 import com.snelnieuws.model.{ArticleCreate, SubscribeRequest}
+import doobie.implicits._
 import com.snelnieuws.repository.{
   ArticleRepository,
   FeatureFlagRepository,
@@ -83,6 +85,16 @@ class NotificationServiceSpec
       requireDb()
       val stub    = new StubApnsMessagingService(acceptAll = true)
       val service = newService(apnsProd = Some(stub))
+
+      // The DB is shared across suites with no per-suite isolation, so this
+      // test must ESTABLISH its "no tokens at this frequency" precondition
+      // rather than assume the tier is globally empty — other suites leave
+      // subscriptions behind (e.g. NewsServletSpec's dispatch-device-1 @ freq
+      // 4, never cleaned up). Crucially, dispatch matches `frequency >= N`
+      // (it's a slot threshold), so a freq-3 dispatch also fans out to freq-4
+      // subscribers — we must clear freq >= 3, not just = 3.
+      sql"DELETE FROM notification_subscriptions WHERE frequency >= 3 AND apns_environment = 'production'"
+        .update.run.transact(Database.transactor).unsafeRunSync()
 
       // A claimable "en" candidate must exist, otherwise dispatch returns
       // NoFreshTopStory instead of Sent. Use a frequency tier with no

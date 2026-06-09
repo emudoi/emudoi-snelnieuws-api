@@ -23,6 +23,7 @@ import com.snelnieuws.repository.{
   ArticleRepository,
   ArticleTrendingScoresRepository,
   EventRepository,
+  FeedServeRepository,
   FeatureFlagRepository,
   ImageCacheRepository,
   NotificationCandidateRepository,
@@ -94,8 +95,13 @@ class Components(
     new ImageCacheRepository(provideTransactor)
   lazy val featureFlagRepository: FeatureFlagRepository =
     new FeatureFlagRepository(provideTransactor)
+  // Article repos are passed so events can be enriched with the catalog
+  // snapshot (title/url + features) at write time (recommender Phase-0).
   lazy val eventRepository: EventRepository =
-    new EventRepository(provideTransactor)
+    new EventRepository(provideTransactor, articleRepository, eulangArticleRepository)
+  // Served-slate log (recommender Phase-0).
+  lazy val feedServeRepository: FeedServeRepository =
+    new FeedServeRepository(provideTransactor)
   // Trending-search ranking: raw trend batches + per-article boost scores.
   lazy val seoTrendsRepository: SeoTrendsRepository =
     new SeoTrendsRepository(provideTransactor)
@@ -492,7 +498,8 @@ class Components(
       semanticQueryService,
       ingestionApiClient,
       eulangArticleRepository = Some(eulangArticleRepository),
-      eventRepository = Some(eventRepository)
+      eventRepository = Some(eventRepository),
+      feedServeRepository = Some(feedServeRepository)
     )
   lazy val notificationDispatchServlet: NotificationDispatchServlet =
     new NotificationDispatchServlet(
