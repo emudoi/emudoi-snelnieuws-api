@@ -50,6 +50,7 @@ import com.snelnieuws.service.{
   ImageSlowDownloader,
   IngestionApiClient,
   KafkaImageRetryProducer,
+  KafkaUserEventsProducer,
   NotificationService,
   PushyApnsMessagingService,
   SemanticQueryService,
@@ -95,10 +96,27 @@ class Components(
     new ImageCacheRepository(provideTransactor)
   lazy val featureFlagRepository: FeatureFlagRepository =
     new FeatureFlagRepository(provideTransactor)
+  // User-events Kafka producer (recommender Phase-1). Ships dark — only
+  // constructed when kafka.user-events.enabled is true, otherwise the event
+  // write path publishes nothing (zero overhead).
+  private val userEventsKafkaCfg = rootConfig.getConfig("kafka.user-events")
+  lazy val userEventsProducer: Option[KafkaUserEventsProducer] =
+    if (userEventsKafkaCfg.getBoolean("enabled"))
+      Some(new KafkaUserEventsProducer(
+        bootstrapServers = userEventsKafkaCfg.getString("bootstrap-servers"),
+        topic            = userEventsKafkaCfg.getString("topic")
+      ))
+    else None
   // Article repos are passed so events can be enriched with the catalog
-  // snapshot (title/url + features) at write time (recommender Phase-0).
+  // snapshot (title/url + features) at write time (recommender Phase-0). The
+  // producer's publish is wired in only when enabled (Phase-1).
   lazy val eventRepository: EventRepository =
-    new EventRepository(provideTransactor, articleRepository, eulangArticleRepository)
+    new EventRepository(
+      provideTransactor, articleRepository, eulangArticleRepository,
+      publish = userEventsProducer
+        .map(p => (es: List[com.snelnieuws.model.UserEventExport]) => p.publish(es))
+        .getOrElse((_: List[com.snelnieuws.model.UserEventExport]) => ())
+    )
   // Served-slate log (recommender Phase-0).
   lazy val feedServeRepository: FeedServeRepository =
     new FeedServeRepository(provideTransactor)

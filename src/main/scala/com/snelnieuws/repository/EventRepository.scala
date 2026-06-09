@@ -2,7 +2,7 @@ package com.snelnieuws.repository
 
 import cats.effect.IO
 import cats.effect.unsafe.implicits.global
-import com.snelnieuws.model.{ArticleStamp, UserEvent, UserEventInput}
+import com.snelnieuws.model.{ArticleStamp, UserEvent, UserEventExport, UserEventInput}
 import doobie._
 import doobie.implicits._
 import doobie.hikari.HikariTransactor
@@ -28,7 +28,11 @@ import scala.util.Try
 class EventRepository(
   provideTransactor: => HikariTransactor[IO],
   articleRepository: ArticleRepository,
-  eulangArticleRepository: ArticleRepository
+  eulangArticleRepository: ArticleRepository,
+  // Best-effort sink to the `user.events` Kafka topic (recommender Phase-1).
+  // No-op by default so the producer ships dark; Components wires the real
+  // publisher only when kafka.user-events.enabled is true.
+  publish: List[UserEventExport] => Unit = _ => ()
 ) {
 
   private val logger = LoggerFactory.getLogger(classOf[EventRepository])
@@ -89,26 +93,39 @@ class EventRepository(
     val accepted = events.filter(e => UserEvent.AllowedTypes.contains(e.`type`))
     val stamps   = stampsFor(accepted)
 
-    val rows: List[Row] = accepted.map { e =>
+    // Resolve the enriched fields once, then project into both the DB row and
+    // the Kafka export so the two never drift.
+    case class Enriched(
+      articleId: Option[String], dwellMs: Option[Long], position: Option[Int],
+      listName: Option[String], country: Option[String], language: Option[String],
+      ts: Option[OffsetDateTime], category: Option[String], source: Option[String],
+      props: Option[String], title: Option[String], url: Option[String], eventType: String
+    )
+
+    val enriched: List[Enriched] = accepted.map { e =>
       val stamp = e.articleId.map(_.trim).filter(_.nonEmpty).flatMap(stamps.get)
       // Server-side snapshot wins when the catalog still has the article;
       // client-sent values are the fallback for already-purged articles.
-      (
-        clientId,
-        e.`type`,
-        clip(e.articleId, 64),
-        e.dwellMs.filter(_ >= 0).map(d => math.min(d, 86400000L)), // cap at 24h
-        e.position.filter(_ >= 0),
-        clip(e.list, 64),
-        stamp.flatMap(_.country).orElse(clip(e.country, 8)),
-        stamp.map(_.language).orElse(clip(e.language, 8)),
-        parseTs(e.ts),
-        stamp.flatMap(_.category).orElse(clip(e.category, 64)),
-        stamp.flatMap(_.source).map(_.take(128)).orElse(clip(e.source, 128)),
-        propsJson(e.props),
-        stamp.map(_.title.take(500)),
-        stamp.map(_.url.take(1000))
+      Enriched(
+        articleId = clip(e.articleId, 64),
+        dwellMs   = e.dwellMs.filter(_ >= 0).map(d => math.min(d, 86400000L)), // cap at 24h
+        position  = e.position.filter(_ >= 0),
+        listName  = clip(e.list, 64),
+        country   = stamp.flatMap(_.country).orElse(clip(e.country, 8)),
+        language  = stamp.map(_.language).orElse(clip(e.language, 8)),
+        ts        = parseTs(e.ts),
+        category  = stamp.flatMap(_.category).orElse(clip(e.category, 64)),
+        source    = stamp.flatMap(_.source).map(_.take(128)).orElse(clip(e.source, 128)),
+        props     = propsJson(e.props),
+        title     = stamp.map(_.title.take(500)),
+        url       = stamp.map(_.url.take(1000)),
+        eventType = e.`type`
       )
+    }
+
+    val rows: List[Row] = enriched.map { x =>
+      (clientId, x.eventType, x.articleId, x.dwellMs, x.position, x.listName, x.country,
+       x.language, x.ts, x.category, x.source, x.props, x.title, x.url)
     }
     if (rows.isEmpty) return Right(0)
 
@@ -117,9 +134,23 @@ class EventRepository(
            (client_id, event_type, article_id, dwell_ms, position, list_name, country, language, event_ts,
             category, source, props, title, url)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?::jsonb,?,?)"""
-    try
-      Right(Update[Row](sql).updateMany(rows).transact(transactor).unsafeRunSync())
-    catch {
+    try {
+      val n = Update[Row](sql).updateMany(rows).transact(transactor).unsafeRunSync()
+      // Best-effort publish AFTER the system-of-record write succeeds. No-op
+      // when the producer ships dark; never throws (the callback swallows).
+      val exports = enriched.map { x =>
+        UserEventExport(
+          clientId = clientId, eventType = x.eventType, articleId = x.articleId,
+          title = x.title, url = x.url, category = x.category, source = x.source,
+          language = x.language, country = x.country, position = x.position,
+          listName = x.listName, dwellMs = x.dwellMs,
+          ts = x.ts.map(_.toString)
+        )
+      }
+      try publish(exports)
+      catch { case e: Exception => logger.warn(s"user.events publish skipped: ${e.getMessage}") }
+      Right(n)
+    } catch {
       case e: Exception =>
         logger.error(s"Failed to insert ${rows.size} user_events for client=$clientId: ${e.getMessage}", e)
         Left(e)
