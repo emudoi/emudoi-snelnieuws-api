@@ -181,10 +181,7 @@ class AndroidNotificationService(
     picksByLanguage: Map[String, PoolPick],
     runId:           UUID
   ): Either[Throwable, DispatchOutcome] = {
-    val notifMessages: Map[String, String] =
-      picksByLanguage.map { case (lang, pick) => lang -> pick.title }
-
-    val (sent, failed) = sendByLanguage(client, frequency, notifMessages)
+    val (sent, failed) = sendByLanguage(client, frequency, picksByLanguage)
     logger.info(
       s"dispatch: android runId=$runId freq=$frequency " +
         s"languages=${picksByLanguage.keys.toList.sorted.mkString(",")} " +
@@ -202,19 +199,22 @@ class AndroidNotificationService(
   private def sendByLanguage(
     client: FcmMessagingService,
     frequency: Option[Int],
-    messages: Map[String, String]
+    picks: Map[String, PoolPick]
   ): (Int, Int) = {
     val grouped = subscriptionRepository
       .findTokensByLanguageGrouped(frequency)
       .getOrElse(Map.empty)
     var totalSent   = 0
     var totalFailed = 0
-    messages.foreach { case (lang, title) =>
+    picks.foreach { case (lang, pick) =>
       grouped.get(lang).filter(_.nonEmpty) match {
         case None =>
           logger.debug(s"dispatch: no Android subscribers for lang=$lang freq=$frequency")
         case Some(tokens) =>
-          val (sent, failed) = client.sendBatch(tokens, title, "")
+          // Top-story candidates come from the main article table, so the
+          // public id is the raw id as a string (no eulang `e` prefix).
+          val articleId = pick.candidate.representativeArticleId.toString
+          val (sent, failed) = client.sendBatch(tokens, pick.title, "", Some(articleId))
           totalSent   += sent
           totalFailed += failed
       }

@@ -27,8 +27,16 @@ trait FcmMessagingService {
     * Implementations should remove tokens FCM reports as `UNREGISTERED` or
     * `INVALID_ARGUMENT` (the token is no longer deliverable) from
     * `android_notification_subscriptions` — symmetric to the iOS APNs path.
+    *
+    * `articleId`, when present, is attached to the message `data` map so the
+    * app can deep-link to that article on tap. Broadcasts pass None.
     */
-  def sendBatch(tokens: List[String], title: String, body: String): (Int, Int)
+  def sendBatch(
+    tokens: List[String],
+    title: String,
+    body: String,
+    articleId: Option[String] = None
+  ): (Int, Int)
 }
 
 /** Real FCM client backed by firebase-admin's `FirebaseMessaging`. Auth is
@@ -80,7 +88,12 @@ class FirebaseFcmMessagingService(
   // FCM caps multicast at 500 tokens per request.
   private val MulticastChunk = 500
 
-  override def sendBatch(tokens: List[String], title: String, body: String): (Int, Int) = {
+  override def sendBatch(
+    tokens: List[String],
+    title: String,
+    body: String,
+    articleId: Option[String] = None
+  ): (Int, Int) = {
     if (tokens.isEmpty) return (0, 0)
     val notification = FcmNotification.builder().setTitle(title).setBody(body).build()
     val messaging    = FirebaseMessaging.getInstance()
@@ -90,6 +103,7 @@ class FirebaseFcmMessagingService(
 
     tokens.grouped(MulticastChunk).foreach { chunk =>
       val builder = MulticastMessage.builder().setNotification(notification)
+      articleId.foreach(id => builder.putData("articleId", id))
       chunk.foreach(builder.addToken)
       val msg = builder.build()
 

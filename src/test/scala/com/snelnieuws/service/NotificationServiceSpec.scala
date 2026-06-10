@@ -176,6 +176,12 @@ class NotificationServiceSpec
 
       stub.batches should not be empty
       stub.batches.flatMap(_.tokens) should contain("ns-spec-token-2")
+      // The pushed top story's id rides along (the public, non-eulang form)
+      // so a tap deep-links to the article. Which story wins the pool depends
+      // on DB state, so we assert a numeric id is present rather than a value.
+      val sentIds = stub.batches.flatMap(_.articleId)
+      sentIds should not be empty
+      sentIds.foreach(_ should fullyMatch regex """\d+""")
     }
 
     "route sandbox dispatches to the sandbox client and skip production tokens" in {

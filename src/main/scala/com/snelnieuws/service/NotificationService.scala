@@ -249,10 +249,7 @@ class NotificationService(
     picksByLanguage: Map[String, PoolPick],
     runId:           UUID
   ): Either[Throwable, DispatchOutcome] = {
-    val notifMessages: Map[String, String] =
-      picksByLanguage.map { case (lang, pick) => lang -> pick.title }
-
-    val (sent, failed) = sendByLanguage(client, frequency, environment, notifMessages)
+    val (sent, failed) = sendByLanguage(client, frequency, environment, picksByLanguage)
     logger.info(
       s"dispatch: runId=$runId env=$environment freq=$frequency " +
         s"languages=${picksByLanguage.keys.toList.sorted.mkString(",")} " +
@@ -270,27 +267,31 @@ class NotificationService(
     title:     String
   )
 
-  /** Per-language fan-out. For each language with a message, look up the
-    * matching subscriber tokens and send the localized title. Body is
-    * empty so the lockscreen stays single-line. Languages with no
-    * matching subscribers are silently skipped. */
+  /** Per-language fan-out. For each language with a pick, look up the
+    * matching subscriber tokens and send the localized title plus the
+    * article id (so a tap deep-links to the article). Body is empty so the
+    * lockscreen stays single-line. Languages with no matching subscribers
+    * are silently skipped. */
   private def sendByLanguage(
     client: ApnsMessagingService,
     frequency: Option[Int],
     environment: String,
-    messages: Map[String, String]
+    picks: Map[String, PoolPick]
   ): (Int, Int) = {
     val grouped = subscriptionRepository
       .findTokensByLanguageGrouped(environment, frequency)
       .getOrElse(Map.empty)
     var totalSent   = 0
     var totalFailed = 0
-    messages.foreach { case (lang, title) =>
+    picks.foreach { case (lang, pick) =>
       grouped.get(lang).filter(_.nonEmpty) match {
         case None =>
           logger.debug(s"dispatch: no subscribers for lang=$lang env=$environment freq=$frequency")
         case Some(tokens) =>
-          val (sent, failed) = client.sendBatch(tokens, title, "")
+          // Top-story candidates come from the main article table, so the
+          // public id is the raw id as a string (no eulang `e` prefix).
+          val articleId = pick.candidate.representativeArticleId.toString
+          val (sent, failed) = client.sendBatch(tokens, pick.title, "", Some(articleId))
           totalSent   += sent
           totalFailed += failed
       }

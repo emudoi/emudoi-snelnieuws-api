@@ -22,8 +22,17 @@ trait ApnsMessagingService {
   /** Sends an alert push to every device token in parallel and returns
    *  (sent, failed). Implementations should remove tokens APNs reports as
    *  `Unregistered` or `BadDeviceToken` from `notification_subscriptions`.
+   *
+   *  `articleId`, when present, is added as a top-level custom field next to
+   *  `aps` so the app can deep-link to that article on tap. Broadcasts pass
+   *  None (no single article).
    */
-  def sendBatch(tokens: List[String], title: String, body: String): (Int, Int)
+  def sendBatch(
+    tokens: List[String],
+    title: String,
+    body: String,
+    articleId: Option[String] = None
+  ): (Int, Int)
 }
 
 /** Real APNs HTTP/2 client, authenticated via JWT signed with the provided
@@ -55,9 +64,14 @@ class PushyApnsMessagingService(
     c
   }
 
-  def sendBatch(tokens: List[String], title: String, body: String): (Int, Int) = {
+  def sendBatch(
+    tokens: List[String],
+    title: String,
+    body: String,
+    articleId: Option[String] = None
+  ): (Int, Int) = {
     if (tokens.isEmpty) return (0, 0)
-    val payload = buildPayload(title, body)
+    val payload = buildPayload(title, body, articleId)
 
     val futures: List[(String, CompletableFuture[PushNotificationResponse[SimpleApnsPushNotification]])] =
       tokens.map { token =>
@@ -96,8 +110,13 @@ class PushyApnsMessagingService(
     (sent, failed)
   }
 
-  private def buildPayload(title: String, body: String): String =
-    s"""{"aps":{"alert":{"title":"${escape(title)}","body":"${escape(body)}"},"sound":"default"}}"""
+  private def buildPayload(title: String, body: String, articleId: Option[String]): String = {
+    val aps = s""""aps":{"alert":{"title":"${escape(title)}","body":"${escape(body)}"},"sound":"default"}"""
+    // Custom keys live alongside `aps` (APNs ignores them); the app reads
+    // userInfo["articleId"] on tap to deep-link to the article.
+    val extra = articleId.map(id => s""","articleId":"${escape(id)}"""").getOrElse("")
+    s"""{$aps$extra}"""
+  }
 
   private def escape(s: String): String =
     s.replace("\\", "\\\\").replace("\"", "\\\"")

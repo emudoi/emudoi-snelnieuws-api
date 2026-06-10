@@ -13,7 +13,12 @@ class StubFcmMessagingService(
   acceptAll: Boolean = true
 ) extends FcmMessagingService {
 
-  case class SentBatch(tokens: List[String], title: String, body: String)
+  case class SentBatch(
+    tokens: List[String],
+    title: String,
+    body: String,
+    articleId: Option[String] = None
+  )
 
   private val recorded = mutable.ListBuffer.empty[SentBatch]
 
@@ -21,9 +26,14 @@ class StubFcmMessagingService(
 
   def clear(): Unit = recorded.synchronized(recorded.clear())
 
-  override def sendBatch(tokens: List[String], title: String, body: String): (Int, Int) = {
+  override def sendBatch(
+    tokens: List[String],
+    title: String,
+    body: String,
+    articleId: Option[String] = None
+  ): (Int, Int) = {
     recorded.synchronized {
-      recorded += SentBatch(tokens, title, body)
+      recorded += SentBatch(tokens, title, body, articleId)
     }
     if (acceptAll) (tokens.size, 0)
     else {

@@ -123,6 +123,12 @@ class AndroidNotificationServiceSpec
 
       stub.batches should not be empty
       stub.batches.flatMap(_.tokens) should contain("and-spec-token-2")
+      // The pushed top story's id rides along (FCM data) so a tap deep-links.
+      // Which story wins the pool depends on DB state, so we assert a numeric
+      // id is present rather than a specific value.
+      val sentIds = stub.batches.flatMap(_.articleId)
+      sentIds should not be empty
+      sentIds.foreach(_ should fullyMatch regex """\d+""")
     }
   }
 
