@@ -130,6 +130,13 @@ spec:
             # longer resolves. Pure config, not a secret — kept in the manifest.
             - name: KAFKA_BOOTSTRAP_SERVERS
               value: "kafka.kafka.svc.cluster.local:9092"
+            # Publish first-party engagement events to the user.events topic for
+            # the LinUCB recommender to learn from (recommender Phase-1). Events
+            # are also persisted to Postgres regardless; this only adds the
+            # stream. The FEED stays unchanged — recommender re-ranking is gated
+            # separately by the recommender_enabled DB flag (off).
+            - name: KAFKA_USER_EVENTS_ENABLED
+              value: "true"
             # Origin used to build absolute urlToImage values in API
             # responses. Same host iOS already calls (see ingress.yaml +
             # NewsAPIService.swift:15) so AsyncImage(url: ...) works
