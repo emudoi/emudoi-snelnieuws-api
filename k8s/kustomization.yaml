@@ -21,3 +21,19 @@ resources:
 images:
   - name: ghcr.io/emudoi/emudoi-snelnieuws-api
     newTag: main
+
+# Grafana dashboard shipped as a ConfigMap. The monitoring stack's Grafana
+# sidecar auto-loads any CM labeled grafana_dashboard=1 from every namespace
+# (searchNamespace: ALL) into the folder named by the grafana_folder
+# annotation — zero edits to the monitoring role.
+configMapGenerator:
+  - name: snelnieuws-api-dashboard
+    files:
+      - service.json=dashboards/service.json
+    options:
+      labels:
+        grafana_dashboard: "1"
+      annotations:
+        grafana_folder: Services
+generatorOptions:
+  disableNameSuffixHash: true
