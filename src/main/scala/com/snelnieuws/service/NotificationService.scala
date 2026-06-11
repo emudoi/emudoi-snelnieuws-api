@@ -14,6 +14,7 @@ import com.snelnieuws.repository.{
   NotificationCandidateRepository,
   NotificationSubscriptionRepository
 }
+import io.circe.Json
 import org.slf4j.LoggerFactory
 
 import java.time.OffsetDateTime
@@ -78,10 +79,19 @@ class NotificationService(
   featureFlagRepository: FeatureFlagRepository,
   candidateRepository: NotificationCandidateRepository,
   apnsProd: Option[ApnsMessagingService],
-  apnsSandbox: Option[ApnsMessagingService]
+  apnsSandbox: Option[ApnsMessagingService],
+  // Bridge to ingestion-api's top-story selection (the same selector
+  // marketing uses). Optional so existing callers/tests construct unchanged;
+  // gated by the notif_ingestion_select_enabled flag with a local fallback.
+  ingestionApiClient: Option[IngestionApiClient] = None
 ) {
 
   private val logger = LoggerFactory.getLogger(classOf[NotificationService])
+
+  // When on, per-language top-story selection is delegated to ingestion-api
+  // (POST /api/internal/top-stories/select) — embedding-cluster Tier 1a +
+  // heuristic tiers, identical to marketing. Off → local TopStorySelector.
+  private val NotifIngestionSelectFlag = "notif_ingestion_select_enabled"
 
   def subscribe(
     req: SubscribeRequest,
@@ -168,15 +178,86 @@ class NotificationService(
     ) { (accE, lang) =>
       accE.flatMap { acc =>
         for {
-          articlesL <- articleRepository.findRecentForTopStory(lang, recentSince)
-          fresh     = TopStorySelector
-                        .selectTopN(articlesL, NotificationPoolConfig.PoolSize)
+          selections <- selectForLanguage(lang, recentSince)
+          fresh     = selections
                         .filterNot(s => dedupSet.contains(s.representativeArticleId))
           _         <- insertFreshPool(runId, lang, fresh, expiresAt)
           claimed   <- claimBestForLanguage(lang, now)
         } yield claimed.fold(acc)(p => acc + (lang -> p))
       }
     }
+
+  /** Top-N selections for one language. When the
+    * `notif_ingestion_select_enabled` flag is on and the bridge is wired,
+    * delegate to ingestion-api's selector (the same one marketing uses);
+    * otherwise — or on ANY failure (flag off, ingestion down, no URL maps to
+    * a local article) — fall back to the local `TopStorySelector`. Failure is
+    * never propagated: notifications must keep working. */
+  private def selectForLanguage(
+    lang:        String,
+    recentSince: OffsetDateTime
+  ): Either[Throwable, Seq[TopStorySelector.Selection]] = {
+    val useIngestion =
+      ingestionApiClient.isDefined &&
+        featureFlagRepository.isEnabled(NotifIngestionSelectFlag).getOrElse(false)
+
+    def local(): Either[Throwable, Seq[TopStorySelector.Selection]] =
+      articleRepository
+        .findRecentForTopStory(lang, recentSince)
+        .map(arts => TopStorySelector.selectTopN(arts, NotificationPoolConfig.PoolSize))
+
+    if (!useIngestion) local()
+    else
+      ingestionApiClient.get.selectTopStories(lang) match {
+        case Right(sels) if sels.nonEmpty =>
+          mapIngestionSelections(lang, sels) match {
+            case mapped if mapped.nonEmpty => Right(mapped)
+            case _ =>
+              logger.info(s"notif: ingestion selections didn't map to local articles lang=$lang; falling back")
+              local()
+          }
+        case Right(_) =>
+          Right(Nil) // ingestion said no_fresh_top_story — honour it (no pool)
+        case Left(e) =>
+          logger.warn(s"notif: ingestion select failed lang=$lang (${e.getMessage}); falling back to local")
+          local()
+      }
+  }
+
+  /** Map ordered ingestion selections back to local snelnieuws articles by
+    * URL (the deep-link needs the snelnieuws id), preserving the ingestion
+    * order + tier. URLs with no local article are dropped. */
+  private def mapIngestionSelections(
+    lang: String,
+    sels: List[TopStorySelection]
+  ): Seq[TopStorySelector.Selection] = {
+    val rows = articleRepository
+      .findV3ByUrls(sels.map(_.url), country = "", language = lang)
+      .getOrElse(Nil)
+    val byUrl = rows.map(r => r.url.toLowerCase -> r).toMap
+    sels.flatMap { sel =>
+      byUrl.get(sel.url.toLowerCase).map { row =>
+        TopStorySelector.Selection(
+          representativeArticleId = row.id,
+          representativeUrl       = row.url,
+          tier                    = tierFromCode(sel.tier),
+          windowSize              = sels.size,
+          selectionMetadata       = Json.obj(
+            "source"                    -> Json.fromString("ingestion_select"),
+            "ingestion_tier"            -> Json.fromInt(sel.tier.toInt),
+            "representative_article_id" -> Json.fromLong(row.id)
+          )
+        )
+      }
+    }
+  }
+
+  private def tierFromCode(code: Short): TopStorySelector.Tier = code match {
+    case 1 => TopStorySelector.Tier1Heuristic
+    case 2 => TopStorySelector.Tier2SinglePublisher
+    case 3 => TopStorySelector.Tier3PoliticsOrBusiness
+    case _ => TopStorySelector.Tier4LastResort
+  }
 
   /** Persist the fresh top-N pool for one language under `runId`.
     * No-op when `fresh` is empty (no articles in the recent window, or

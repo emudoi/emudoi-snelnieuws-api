@@ -28,6 +28,12 @@ object SemanticMatch {
   implicit val encoder: Encoder[SemanticMatch] = deriveEncoder
 }
 
+/** One top-story selection from ingestion-api's /api/internal/top-stories/select.
+  * `url` is the join key back to the snelnieuws `articles` row (the notification
+  * deep-links by snelnieuws id, not ingestion id); `tier` is the selector tier
+  * code (1=heuristic/embedding cluster … 4=last-resort). Ordered best-first. */
+case class TopStorySelection(url: String, title: String, tier: Short)
+
 class IngestionApiError(val status: Int, val body: String)
   extends RuntimeException(s"ingestion-api responded $status: ${body.take(200)}")
 
@@ -45,7 +51,12 @@ class IngestionApiError(val status: Int, val body: String)
   */
 class IngestionApiClient(
   baseUrl: String,
-  apiKey: String
+  apiKey: String,
+  // Separate key for the internal top-story selection endpoint
+  // (ingestion-api/ingestion-internal-key) — distinct from the
+  // semantic-search-key above. Optional so existing test harnesses
+  // construct unchanged; selectTopStories returns Left if it's empty.
+  internalApiKey: String = ""
 ) {
 
   private val log = LoggerFactory.getLogger(classOf[IngestionApiClient])
@@ -94,6 +105,63 @@ class IngestionApiClient(
       decodeSearchResponse(resp)
     }
   }
+
+  /** Call ingestion-api's POST /api/internal/top-stories/select — the SAME
+    * top-story selector marketing-api uses (server-side window fetch + Milvus
+    * embedding clustering Tier 1a + the heuristic tier ladder). Returns the
+    * ordered selections (best-first) for the requested language. A 503
+    * (`no_fresh_top_story`) maps to an empty list, not an error. Uses the
+    * internal key; returns Left if that key wasn't configured. */
+  def selectTopStories(
+    language: String,
+    excludeArticleIds: List[Long] = Nil
+  ): Either[Throwable, List[TopStorySelection]] = {
+    if (internalApiKey.isEmpty)
+      return Left(new IllegalStateException("ingestion internalApiKey not configured"))
+    val body = Json
+      .obj(
+        "language"            -> Json.fromString(language),
+        "require_image"       -> Json.fromBoolean(false),
+        "exclude_article_ids" -> Json.fromValues(excludeArticleIds.map(Json.fromLong))
+      )
+      .noSpaces
+    try {
+      val req = HttpRequest
+        .newBuilder()
+        .uri(URI.create(s"$baseTrimmed/api/internal/top-stories/select"))
+        .timeout(readTimeout)
+        .header("Content-Type", "application/json")
+        .header("X-API-Key", internalApiKey)
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build()
+      val resp   = client.send(req, HttpResponse.BodyHandlers.ofString())
+      val status = resp.statusCode()
+      if (status == 503) Right(Nil) // no_fresh_top_story — normal "no work"
+      else if (status / 100 == 2) decodeSelectResponse(resp.body())
+      else {
+        log.warn(s"ingestion-api top-stories/select returned $status: ${resp.body().take(200)}")
+        Left(new IngestionApiError(status, resp.body()))
+      }
+    } catch {
+      case e: Exception =>
+        log.warn(s"ingestion-api top-stories/select failed: ${e.getClass.getSimpleName}: ${e.getMessage}")
+        Left(e)
+    }
+  }
+
+  private def decodeSelectResponse(raw: String): Either[Throwable, List[TopStorySelection]] =
+    circeParse(raw).left.map(identity[Throwable]).flatMap { json =>
+      json.hcursor.downField("selections").as[List[Json]]
+        .left.map(identity[Throwable])
+        .map(_.flatMap { sel =>
+          val c = sel.hcursor
+          for {
+            url   <- c.downField("url").as[String].toOption
+            title <- c.downField("title").as[String].toOption
+            tier  <- c.downField("tier").as[Int].toOption
+          } yield TopStorySelection(url, title, tier.toShort)
+        })
+    }
 
   // ────────────────────────────── internals ──────────────────────────
 

@@ -293,8 +293,11 @@ class Components(
       notificationSubscriptionRepository,
       featureFlagRepository,
       notificationCandidateRepository,
-      apnsProd    = apns,
-      apnsSandbox = apnsSandbox
+      apnsProd          = apns,
+      apnsSandbox       = apnsSandbox,
+      // Delegate top-story selection to ingestion-api when the
+      // notif_ingestion_select_enabled flag is on (local fallback otherwise).
+      ingestionApiClient = Some(ingestionApiClient)
     )
 
   lazy val androidNotificationService: AndroidNotificationService =
@@ -502,9 +505,31 @@ class Components(
     }
   }
 
+  // Separate key for ingestion-api's internal top-story selection endpoint,
+  // rendered by Vault Agent at /vault/secrets/ingestion-internal-key (vault
+  // path secret/data/ingestion-api/ingestion-internal-key). Empty when the
+  // mount is absent — selectTopStories then returns Left and the notification
+  // path falls back to the local selector.
+  lazy val ingestionApiInternalKey: String = {
+    val pathStr = Try(rootConfig.getString("ingestion-api.internal-key-path"))
+      .toOption.filter(_.nonEmpty)
+      .getOrElse("/vault/secrets/ingestion-internal-key")
+    val path = java.nio.file.Paths.get(pathStr)
+    if (java.nio.file.Files.exists(path))
+      new String(java.nio.file.Files.readAllBytes(path), "UTF-8").trim
+    else {
+      logger.warn(
+        s"ingestion-api internal-key file not found at $pathStr — notification " +
+          "ingestion-select will fall back to the local TopStorySelector."
+      )
+      ""
+    }
+  }
+
   lazy val ingestionApiClient: IngestionApiClient = new IngestionApiClient(
-    baseUrl = rootConfig.getString("ingestion-api.base-url"),
-    apiKey  = ingestionApiSemanticSearchKey
+    baseUrl        = rootConfig.getString("ingestion-api.base-url"),
+    apiKey         = ingestionApiSemanticSearchKey,
+    internalApiKey = ingestionApiInternalKey
   )
 
   lazy val userSemanticQueryRepository: UserSemanticQueryRepository =

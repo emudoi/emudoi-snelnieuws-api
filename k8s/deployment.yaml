@@ -65,6 +65,15 @@ spec:
           {{- with secret "secret/data/ingestion-api/semantic-search-key" -}}
           {{ .Data.data.key }}
           {{- end }}
+        # ingestion-internal-key for POST /api/internal/top-stories/select
+        # (notification top-story selection unified with marketing). Same
+        # secret ingestion-api reads; read access granted via the Phase-A
+        # provisioning extra-vault-paths grant.
+        vault.hashicorp.com/agent-inject-secret-ingestion-internal-key: "secret/data/ingestion-api/ingestion-internal-key"
+        vault.hashicorp.com/agent-inject-template-ingestion-internal-key: |
+          {{- with secret "secret/data/ingestion-api/ingestion-internal-key" -}}
+          {{ .Data.data.key }}
+          {{- end }}
     spec:
       serviceAccountName: emudoi-snelnieuws-api
       imagePullSecrets:
