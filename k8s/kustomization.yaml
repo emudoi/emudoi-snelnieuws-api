@@ -29,7 +29,10 @@ images:
 configMapGenerator:
   - name: snelnieuws-api-dashboard
     files:
-      - service.json=dashboards/service.json
+      # Unique data key per service — the sidecar names the on-disk file
+      # after this key, so a shared key (e.g. service.json) would collide in
+      # the shared Services folder and only the last-written would survive.
+      - snelnieuws-api.json=dashboards/service.json
     options:
       labels:
         grafana_dashboard: "1"
