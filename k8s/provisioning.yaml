@@ -48,6 +48,13 @@ spec:
       # by ingestion-api itself (the producer side); both sides must list it
       # here or the provision-vault step regenerates a policy without it and
       # the vault-agent sidecar crash-loops.
+      # ingestion-internal-key: snelnieuws-api → ingestion-api's
+      # POST /api/internal/top-stories/select (same selector marketing-api
+      # uses for the daily top story). Granting read here BEFORE the
+      # deployment adds the vault-agent annotation avoids a crash-loop on
+      # first rollout (the policy must allow the path before the sidecar
+      # tries to render it).
       - name: extra-vault-paths
         value: |
           ingestion-api/semantic-search-key
+          ingestion-api/ingestion-internal-key
