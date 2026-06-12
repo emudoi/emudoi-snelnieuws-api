@@ -161,4 +161,77 @@ class AppClientRepository(provideTransactor: => HikariTransactor[IO]) {
         logger.error(s"Failed to set served ids for $clientId: ${e.getMessage}", e)
         Left(e)
     }
+
+  // ─────────────────────────── Video reel feed ───────────────────────────
+  //
+  // last_served_video_ids (V42) is the video-only twin of last_served_ids —
+  // a separate JSONB column so video ids never collide with article ids.
+  // VideoFeedService drives the same read → filter → append → reset-on-
+  // exhaust rotation the article feed uses.
+
+  /** Read the stored served-video-id history. Tolerant of unknown client /
+    * null column / parse failure (returns Set.empty), like readServedIds. */
+  def readServedVideoIds(clientId: UUID): Either[Throwable, Set[Long]] =
+    try
+      Right(
+        sql"SELECT last_served_video_ids::text FROM app_clients WHERE client_id = $clientId"
+          .query[String]
+          .option
+          .transact(transactor)
+          .unsafeRunSync()
+          .flatMap(parse(_).toOption)
+          .flatMap(_.asArray)
+          .map(_.flatMap(_.asNumber).flatMap(_.toLong).toSet)
+          .getOrElse(Set.empty[Long])
+      )
+    catch {
+      case e: Exception =>
+        logger.error(s"Failed to read last_served_video_ids for $clientId: ${e.getMessage}", e)
+        Left(e)
+    }
+
+  /** Append `newIds` to the served-video history, dedupe, trim to the most
+    * recent `capAt`. SELECT ... FOR UPDATE so parallel requests don't race. */
+  def appendServedVideoIds(
+    clientId: UUID,
+    newIds: List[Long],
+    capAt: Int = 1000
+  ): Either[Throwable, Int] =
+    if (newIds.isEmpty) Right(0)
+    else
+      try {
+        val program = for {
+          existingJsonOpt <- sql"SELECT last_served_video_ids::text FROM app_clients WHERE client_id = $clientId FOR UPDATE"
+            .query[String].option
+          existing = existingJsonOpt
+            .flatMap(parse(_).toOption)
+            .flatMap(_.asArray)
+            .map(_.flatMap(_.asNumber).flatMap(_.toLong).toList)
+            .getOrElse(List.empty[Long])
+          merged  = (existing ++ newIds).distinct
+          trimmed = merged.takeRight(capAt)
+          json    = trimmed.mkString("[", ",", "]")
+          rows <- sql"UPDATE app_clients SET last_served_video_ids = $json::jsonb WHERE client_id = $clientId"
+            .update.run
+        } yield rows
+        Right(program.transact(transactor).unsafeRunSync())
+      } catch {
+        case e: Exception =>
+          logger.error(s"Failed to append served video ids for $clientId: ${e.getMessage}", e)
+          Left(e)
+      }
+
+  /** Replace the served-video history wholesale (reset-on-exhaust). */
+  def setServedVideoIds(clientId: UUID, ids: List[Long]): Either[Throwable, Int] =
+    try {
+      val json = ids.mkString("[", ",", "]")
+      Right(
+        sql"UPDATE app_clients SET last_served_video_ids = $json::jsonb WHERE client_id = $clientId"
+          .update.run.transact(transactor).unsafeRunSync()
+      )
+    } catch {
+      case e: Exception =>
+        logger.error(s"Failed to set served video ids for $clientId: ${e.getMessage}", e)
+        Left(e)
+    }
 }

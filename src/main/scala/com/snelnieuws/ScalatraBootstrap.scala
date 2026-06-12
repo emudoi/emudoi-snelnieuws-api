@@ -58,6 +58,9 @@ class ScalatraBootstrap extends LifeCycle {
     // anyway, so /v2/android/* always wins over /v2/*. Independent
     // before-filter that requires `X-Client: android/<v>`.
     context.mount(components.androidNotificationsServletV2, "/v2/android/*")
+    // Video reel: /v3/videos/feed (gated) + /v3/videos/:id/stream (open MP4
+    // proxy). Longest-prefix wins over /v3/* regardless of order.
+    context.mount(components.videosServletV3, "/v3/videos/*")
     context.mount(components.newsServletV3, "/v3/*")
     context.mount(components.newsServletV2, "/v2/*")
     // v1 catch-all stays mounted last, conceptually — kept here for

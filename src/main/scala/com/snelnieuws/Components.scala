@@ -12,7 +12,8 @@ import com.snelnieuws.api.{
   NewsServletV3,
   NotificationBroadcastServlet,
   NotificationDispatchServlet,
-  StaticContentServlet
+  StaticContentServlet,
+  VideosServletV3
 }
 import com.snelnieuws.auth.FirebaseTokenVerifier
 import com.snelnieuws.db.Database
@@ -51,7 +52,9 @@ import com.snelnieuws.service.{
   IngestionApiClient,
   KafkaImageRetryProducer,
   KafkaUserEventsProducer,
+  MarketingApiClient,
   NotificationService,
+  VideoFeedService,
   PushyApnsMessagingService,
   RecommenderClient,
   SemanticQueryService,
@@ -532,6 +535,30 @@ class Components(
     internalApiKey = ingestionApiInternalKey
   )
 
+  // Marketing-api X-API-Key: env MARKETING_API_KEY wins (lets a deploy set it
+  // without cross-namespace Vault access), else the Vault-rendered file.
+  lazy val marketingApiKey: String = {
+    sys.env.get("MARKETING_API_KEY").map(_.trim).filter(_.nonEmpty).getOrElse {
+      val pathStr = Try(rootConfig.getString("marketing-api.api-key-path"))
+        .toOption.filter(_.nonEmpty).getOrElse("/vault/secrets/marketing-api-key")
+      val path = java.nio.file.Paths.get(pathStr)
+      if (java.nio.file.Files.exists(path))
+        new String(java.nio.file.Files.readAllBytes(path), "UTF-8").trim
+      else {
+        logger.warn(s"marketing-api key not found at $pathStr and MARKETING_API_KEY unset")
+        ""
+      }
+    }
+  }
+
+  lazy val marketingApiClient: MarketingApiClient = new MarketingApiClient(
+    baseUrl = rootConfig.getString("marketing-api.base-url"),
+    apiKey  = marketingApiKey
+  )
+
+  lazy val videoFeedService: VideoFeedService =
+    new VideoFeedService(marketingApiClient, appClientRepository)
+
   lazy val userSemanticQueryRepository: UserSemanticQueryRepository =
     new UserSemanticQueryRepository(provideTransactor)
 
@@ -552,6 +579,13 @@ class Components(
       eulangArticleRepository = Some(eulangArticleRepository),
       eventRepository = Some(eventRepository),
       feedServeRepository = Some(feedServeRepository)
+    )
+  lazy val videosServletV3: VideosServletV3 =
+    new VideosServletV3(
+      videoFeedService,
+      marketingApiClient,
+      appClientRepository,
+      imagesPublicBaseUrl
     )
   lazy val notificationDispatchServlet: NotificationDispatchServlet =
     new NotificationDispatchServlet(
