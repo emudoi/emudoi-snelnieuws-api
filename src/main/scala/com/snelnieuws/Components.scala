@@ -535,21 +535,16 @@ class Components(
     internalApiKey = ingestionApiInternalKey
   )
 
-  // Marketing-api X-API-Key: env MARKETING_API_KEY wins (lets a deploy set it
-  // without cross-namespace Vault access), else the Vault-rendered file.
-  lazy val marketingApiKey: String = {
-    sys.env.get("MARKETING_API_KEY").map(_.trim).filter(_.nonEmpty).getOrElse {
-      val pathStr = Try(rootConfig.getString("marketing-api.api-key-path"))
-        .toOption.filter(_.nonEmpty).getOrElse("/vault/secrets/marketing-api-key")
-      val path = java.nio.file.Paths.get(pathStr)
-      if (java.nio.file.Files.exists(path))
-        new String(java.nio.file.Files.readAllBytes(path), "UTF-8").trim
-      else {
-        logger.warn(s"marketing-api key not found at $pathStr and MARKETING_API_KEY unset")
-        ""
-      }
-    }
-  }
+  // ⚠️ TEMPORARY / THROWAWAY — the video reel is an experiment against
+  // litikai-marketing-api that we plan to delete once the real video source
+  // lands. The X-API-Key is hard-coded on purpose: it's the same
+  // low-sensitivity key already committed in both apps' fastlane aso_sync,
+  // and wiring Vault for a soon-to-be-removed feature isn't worth it. When the
+  // experiment ends, delete this + the whole marketing-api/video wiring.
+  // (env override kept only for local dev.)
+  lazy val marketingApiKey: String =
+    sys.env.get("MARKETING_API_KEY").map(_.trim).filter(_.nonEmpty)
+      .getOrElse("w+QcnyJcjMlNxSqDRoTOgGurs9zJV7LwUyqQ6s7ofH0U+S6w")
 
   lazy val marketingApiClient: MarketingApiClient = new MarketingApiClient(
     baseUrl = rootConfig.getString("marketing-api.base-url"),
