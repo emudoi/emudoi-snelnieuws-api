@@ -3,7 +3,6 @@ package com.snelnieuws.service
 import io.circe.parser.{parse => circeParse}
 import org.slf4j.LoggerFactory
 
-import java.io.InputStream
 import java.net.URI
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.time.{Duration => JDuration}
@@ -73,27 +72,33 @@ class MarketingApiClient(baseUrl: String, apiKey: String) {
           Left(e)
       }
 
-  /** Open a streaming connection to the MP4 for `id`, forwarding `range` when
-    * present. Returns the live HttpResponse[InputStream] so the servlet can
-    * pass through status (200/206) + content headers and pipe the body. */
-  def streamVideo(id: Long, range: Option[String]): Either[Throwable, HttpResponse[InputStream]] =
+  /** Download the FULL mp4 bytes for `id`. The upstream /download endpoint
+    * does NOT support HTTP Range (always 200), so we fetch the whole file and
+    * let the servlet serve byte ranges itself — iOS AVPlayer requires correct
+    * Range/206 behaviour or it fails with -11850 "server not correctly
+    * configured". Files are short (~1-2 MB), so a small in-memory LRU cache
+    * keeps repeat range requests off the marketing API. */
+  def downloadFull(id: Long): Either[Throwable, Array[Byte]] = {
+    val cached = cache.get(id)
+    if (cached != null) return Right(cached)
     if (apiKey.isEmpty)
       Left(new IllegalStateException("marketing-api apiKey not configured"))
     else
       try {
-        val builder = HttpRequest
+        val req = HttpRequest
           .newBuilder()
           .uri(URI.create(s"$baseTrimmed/api/videos/$id/download"))
           .timeout(streamReadTimeout)
           .header("X-API-Key", apiKey)
-        range.foreach(r => builder.header("Range", r))
-        val resp   = client.send(builder.GET().build(), HttpResponse.BodyHandlers.ofInputStream())
+          .GET()
+          .build()
+        val resp   = client.send(req, HttpResponse.BodyHandlers.ofByteArray())
         val status = resp.statusCode()
-        if (status / 100 == 2) Right(resp)
-        else {
-          // Drain so the connection can be reused; the body is an error page.
-          try resp.body().close()
-          catch { case _: Exception => () }
+        if (status / 100 == 2) {
+          val bytes = resp.body()
+          putCache(id, bytes)
+          Right(bytes)
+        } else {
           log.warn(s"marketing-api download id=$id returned $status")
           Left(new MarketingApiError(status, s"download id=$id status=$status"))
         }
@@ -102,6 +107,18 @@ class MarketingApiClient(baseUrl: String, apiKey: String) {
           log.warn(s"marketing-api download id=$id failed: ${e.getClass.getSimpleName}: ${e.getMessage}")
           Left(e)
       }
+  }
+
+  // Tiny bounded LRU of downloaded mp4s (id -> bytes). access-order=true.
+  private val MaxCached = 12
+  private val cache: java.util.Map[Long, Array[Byte]] =
+    java.util.Collections.synchronizedMap(
+      new java.util.LinkedHashMap[Long, Array[Byte]](16, 0.75f, true) {
+        override def removeEldestEntry(e: java.util.Map.Entry[Long, Array[Byte]]): Boolean =
+          size() > MaxCached
+      }
+    )
+  private def putCache(id: Long, bytes: Array[Byte]): Unit = cache.put(id, bytes)
 
   private def decodeList(raw: String): Either[Throwable, List[MarketingVideo]] =
     circeParse(raw).left.map(identity[Throwable]).flatMap { json =>

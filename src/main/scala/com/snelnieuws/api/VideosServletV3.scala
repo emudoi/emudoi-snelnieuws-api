@@ -119,37 +119,56 @@ class VideosServletV3(
       case None =>
         NotFound(Map("error" -> "invalid id"))
       case Some(id) =>
-        val range = Option(request.getHeader("Range")).map(_.trim).filter(_.nonEmpty)
-        marketingClient.streamVideo(id, range) match {
+        marketingClient.downloadFull(id) match {
           case Left(e) =>
             logger.warn(s"video stream id=$id failed: ${e.getMessage}")
             NotFound(Map("error" -> "video unavailable"))
-          case Right(up) =>
-            response.setStatus(up.statusCode())
-            val ct = up.headers().firstValue("Content-Type")
-            response.setHeader("Content-Type", if (ct.isPresent) ct.get() else "video/mp4")
-            val cl = up.headers().firstValue("Content-Length")
-            if (cl.isPresent) response.setHeader("Content-Length", cl.get())
-            val cr = up.headers().firstValue("Content-Range")
-            if (cr.isPresent) response.setHeader("Content-Range", cr.get())
+          case Right(bytes) =>
+            val total = bytes.length
+            response.setHeader("Content-Type", "video/mp4")
             response.setHeader("Accept-Ranges", "bytes")
             response.setHeader("Cache-Control", "public, max-age=86400")
-            val in  = up.body()
             val out = response.getOutputStream
-            val buf = new Array[Byte](16384)
-            try {
-              var n = in.read(buf)
-              while (n > 0) {
-                out.write(buf, 0, n)
-                n = in.read(buf)
-              }
-              out.flush()
-            } finally {
-              try in.close()
-              catch { case _: Exception => () }
+            // Honour HTTP Range (iOS AVPlayer requires correct 206 behaviour).
+            parseRange(Option(request.getHeader("Range")), total) match {
+              case Some((start, end)) =>
+                val len = end - start + 1
+                response.setStatus(206)
+                response.setHeader("Content-Range", s"bytes $start-$end/$total")
+                response.setHeader("Content-Length", len.toString)
+                out.write(bytes, start, len)
+              case None =>
+                response.setStatus(200)
+                response.setHeader("Content-Length", total.toString)
+                out.write(bytes)
             }
+            out.flush()
             ()
         }
     }
   }
+
+  /** Parse a single-range `bytes=start-end` (or `bytes=start-`, `bytes=-N`)
+    * header against `total`. Returns the inclusive (start, end) clamped to the
+    * file, or None when absent / multi-range / unsatisfiable. */
+  private def parseRange(header: Option[String], total: Int): Option[(Int, Int)] =
+    header.map(_.trim).filter(_.startsWith("bytes=")).flatMap { h =>
+      val spec = h.stripPrefix("bytes=")
+      if (spec.contains(",")) None // multi-range unsupported
+      else
+        Try {
+          if (spec.startsWith("-")) {
+            val n     = spec.drop(1).toInt
+            val start = math.max(0, total - n)
+            (start, total - 1)
+          } else {
+            val parts = spec.split("-", 2)
+            val start = parts(0).toInt
+            val end =
+              if (parts.length > 1 && parts(1).nonEmpty) math.min(parts(1).toInt, total - 1)
+              else total - 1
+            (start, end)
+          }
+        }.toOption.filter { case (s, e) => s >= 0 && e >= s && s < total }
+    }
 }
