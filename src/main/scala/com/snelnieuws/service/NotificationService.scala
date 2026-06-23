@@ -80,6 +80,10 @@ class NotificationService(
   candidateRepository: NotificationCandidateRepository,
   apnsProd: Option[ApnsMessagingService],
   apnsSandbox: Option[ApnsMessagingService],
+  // Absolute base for image URLs (e.g. https://api.snel.emudoi.com). Used to
+  // turn an article's relative url_to_image into an absolute push thumbnail
+  // URL. Empty ("" — the default) disables push images (no absolute host).
+  imagesPublicBaseUrl: String = "",
   // Bridge to ingestion-api's top-story selection (the same selector
   // marketing uses). Optional so existing callers/tests construct unchanged;
   // gated by the notif_ingestion_select_enabled flag with a local fallback.
@@ -308,7 +312,7 @@ class NotificationService(
               case _ =>
                 articleRepository.findById(cand.representativeArticleId).map {
                   case Some(article) =>
-                    Some(PoolPick(candidate = cand, title = article.title))
+                    Some(PoolPick(candidate = cand, title = article.title, imageUrl = article.urlToImage))
                   case None =>
                     logger.warn(
                       s"dispatch: claimed candidate.id=${cand.id} but article.id=${cand.representativeArticleId} " +
@@ -345,8 +349,30 @@ class NotificationService(
     * the dispatcher doesn't need to re-query the article rows. */
   private case class PoolPick(
     candidate: NotificationCandidatePicked,
-    title:     String
+    title:     String,
+    imageUrl:  Option[String] = None
   )
+
+  // Push thumbnail width — small enough to download instantly on cellular.
+  private val PushImageWidth = 600
+
+  /** Absolute, downscaled push-thumbnail URL for an article's relative
+    * url_to_image. None when no base host is configured, the image is empty,
+    * or it's the bundled fallback logo (not worth showing as a thumbnail). */
+  private def thumbUrl(relImageUrl: Option[String]): Option[String] = {
+    val base = imagesPublicBaseUrl.trim.stripSuffix("/")
+    if (base.isEmpty) None
+    else
+      relImageUrl
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .filterNot(_.endsWith("/_fallback"))
+        .map { rel =>
+          val path = if (rel.startsWith("/")) rel else s"/$rel"
+          val sep  = if (path.contains("?")) "&" else "?"
+          s"$base$path${sep}w=$PushImageWidth"
+        }
+  }
 
   /** Per-language fan-out. For each language with a pick, look up the
     * matching subscriber tokens and send the localized title plus the
@@ -372,7 +398,8 @@ class NotificationService(
           // Top-story candidates come from the main article table, so the
           // public id is the raw id as a string (no eulang `e` prefix).
           val articleId = pick.candidate.representativeArticleId.toString
-          val (sent, failed) = client.sendBatch(tokens, pick.title, "", Some(articleId))
+          val (sent, failed) =
+            client.sendBatch(tokens, pick.title, "", Some(articleId), thumbUrl(pick.imageUrl))
           totalSent   += sent
           totalFailed += failed
       }

@@ -40,7 +40,11 @@ class AndroidNotificationService(
   subscriptionRepository: AndroidNotificationSubscriptionRepository,
   featureFlagRepository: FeatureFlagRepository,
   candidateRepository: NotificationCandidateRepository,
-  fcm: Option[FcmMessagingService]
+  fcm: Option[FcmMessagingService],
+  // Absolute base for image URLs (e.g. https://api.snel.emudoi.com); turns an
+  // article's relative url_to_image into an absolute FCM notification image.
+  // Empty ("" — default) disables push images.
+  imagesPublicBaseUrl: String = ""
 ) {
 
   private val logger = LoggerFactory.getLogger(classOf[AndroidNotificationService])
@@ -162,7 +166,7 @@ class AndroidNotificationService(
               case _ =>
                 articleRepository.findById(cand.representativeArticleId).map {
                   case Some(article) =>
-                    Some(PoolPick(candidate = cand, title = article.title))
+                    Some(PoolPick(candidate = cand, title = article.title, imageUrl = article.urlToImage))
                   case None =>
                     logger.warn(
                       s"dispatch: android claimed candidate.id=${cand.id} but article.id=${cand.representativeArticleId} " +
@@ -193,8 +197,30 @@ class AndroidNotificationService(
 
   private case class PoolPick(
     candidate: NotificationCandidatePicked,
-    title:     String
+    title:     String,
+    imageUrl:  Option[String] = None
   )
+
+  // Push thumbnail width — small enough to download instantly on cellular.
+  private val PushImageWidth = 600
+
+  /** Absolute, downscaled push-thumbnail URL for an article's relative
+    * url_to_image. None when no base host is configured, the image is empty,
+    * or it's the bundled fallback logo. */
+  private def thumbUrl(relImageUrl: Option[String]): Option[String] = {
+    val base = imagesPublicBaseUrl.trim.stripSuffix("/")
+    if (base.isEmpty) None
+    else
+      relImageUrl
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .filterNot(_.endsWith("/_fallback"))
+        .map { rel =>
+          val path = if (rel.startsWith("/")) rel else s"/$rel"
+          val sep  = if (path.contains("?")) "&" else "?"
+          s"$base$path${sep}w=$PushImageWidth"
+        }
+  }
 
   private def sendByLanguage(
     client: FcmMessagingService,
@@ -214,7 +240,8 @@ class AndroidNotificationService(
           // Top-story candidates come from the main article table, so the
           // public id is the raw id as a string (no eulang `e` prefix).
           val articleId = pick.candidate.representativeArticleId.toString
-          val (sent, failed) = client.sendBatch(tokens, pick.title, "", Some(articleId))
+          val (sent, failed) =
+            client.sendBatch(tokens, pick.title, "", Some(articleId), thumbUrl(pick.imageUrl))
           totalSent   += sent
           totalFailed += failed
       }

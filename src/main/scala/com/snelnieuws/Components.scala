@@ -298,6 +298,7 @@ class Components(
       notificationCandidateRepository,
       apnsProd          = apns,
       apnsSandbox       = apnsSandbox,
+      imagesPublicBaseUrl = imagesPublicBaseUrl,
       // Delegate top-story selection to ingestion-api when the
       // notif_ingestion_select_enabled flag is on (local fallback otherwise).
       ingestionApiClient = Some(ingestionApiClient)
@@ -309,7 +310,8 @@ class Components(
       androidNotificationSubscriptionRepository,
       featureFlagRepository,
       notificationCandidateRepository,
-      fcm = fcm
+      fcm = fcm,
+      imagesPublicBaseUrl = imagesPublicBaseUrl
     )
 
   lazy val userService: UserService =

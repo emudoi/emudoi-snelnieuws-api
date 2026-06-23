@@ -4,10 +4,15 @@ import com.snelnieuws.model.{ImageCacheRow, ImageCacheStatus}
 import com.snelnieuws.repository.ImageCacheRepository
 import org.slf4j.LoggerFactory
 
+import java.awt.image.BufferedImage
+import java.awt.{Color, RenderingHints}
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
 import java.net.URI
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.nio.file.{Files, Path, Paths, StandardCopyOption}
 import java.security.MessageDigest
+import javax.imageio.stream.MemoryCacheImageOutputStream
+import javax.imageio.{IIOImage, ImageIO, ImageWriteParam}
 import java.time.{Duration => JDuration, OffsetDateTime}
 import scala.util.{Failure, Success, Try}
 
@@ -198,6 +203,41 @@ class ImageCacheService(
     }
   }
 
+  /** Read a small JPEG thumbnail (≤ `width` px wide) of a cached image, for
+    * use as a push-notification image where the original (up to max-bytes,
+    * 10 MB) is far too heavy to download on cellular.
+    *
+    * The resized variant is cached on NFS next to the original
+    * (`<rel>.w<width>.jpg`) so the resize cost is one-time. Returns
+    * Left(NoSuchFileException) when the original isn't on disk yet, and
+    * Left(UnsupportedImageException) when the bytes can't be decoded by
+    * ImageIO (WebP/AVIF/HEIC sources) — callers should then simply omit the
+    * image rather than fall back to the full-size original. */
+  def readResized(relativePath: String, width: Int): Either[Throwable, (Array[Byte], Option[String])] = {
+    val w = width.max(ImageCacheService.MinThumbWidth).min(ImageCacheService.MaxThumbWidth)
+    val variantPath = s"$relativePath.w$w.jpg"
+    // Serve the cached variant if it already exists.
+    canonicalizeUnderRoot(variantPath) match {
+      case Right(v) if Files.exists(v) =>
+        return (try Right((Files.readAllBytes(v), Some("image/jpeg")))
+        catch { case e: Exception => Left(e) })
+      case Left(e) => return Left(e)
+      case _       => // fall through and generate
+    }
+    readBytes(relativePath) match {
+      case Left(e) => Left(e)
+      case Right((bytes, _)) =>
+        ImageCacheService.resizeToJpeg(bytes, w) match {
+          case Some(jpeg) =>
+            try writeAtomic(variantPath, jpeg)
+            catch { case e: Exception => logger.warn(s"thumb cache write failed $variantPath: ${e.getMessage}") }
+            Right((jpeg, Some("image/jpeg")))
+          case None =>
+            Left(new ImageCacheService.UnsupportedImageException(relativePath))
+        }
+    }
+  }
+
   /** Map a Throwable from the fast-path download attempt to its
     * DownloadFailure classification. Used by the worker (after
     * upsertFailed runs) and by tests. */
@@ -355,6 +395,55 @@ object ImageCacheService {
   // Lifted out of resolveOrFetch.fail-path so callers can pattern-match
   // distinctly from arbitrary network errors and choose to suppress logs.
   class RetryNotDueException(msg: String) extends RuntimeException(msg)
+
+  // Thumbnail sizing bounds for readResized (push-notification images).
+  private[service] val MinThumbWidth = 64
+  private[service] val MaxThumbWidth = 1080
+
+  /** Raised when ImageIO can't decode the cached bytes (e.g. WebP/AVIF). */
+  class UnsupportedImageException(rel: String)
+    extends RuntimeException(s"cannot decode image for thumbnail: $rel")
+
+  /** Resize image bytes to a JPEG no wider than `width` (never upscales),
+    * flattening transparency onto white. Returns None if the bytes can't be
+    * decoded by the stock ImageIO codecs. Pure/CPU-only — no IO. */
+  def resizeToJpeg(bytes: Array[Byte], width: Int, quality: Float = 0.78f): Option[Array[Byte]] = {
+    Try {
+      val src = ImageIO.read(new ByteArrayInputStream(bytes))
+      if (src == null) None
+      else {
+        val w0 = src.getWidth
+        val h0 = src.getHeight
+        if (w0 <= 0 || h0 <= 0) None
+        else {
+          val targetW = math.min(width, w0)
+          val targetH = math.max(1, math.round(h0.toDouble * targetW / w0).toInt)
+          val dst     = new BufferedImage(targetW, targetH, BufferedImage.TYPE_INT_RGB)
+          val g       = dst.createGraphics()
+          g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR)
+          g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY)
+          g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+          g.setColor(Color.WHITE) // flatten any alpha — JPEG has no transparency
+          g.fillRect(0, 0, targetW, targetH)
+          g.drawImage(src, 0, 0, targetW, targetH, null)
+          g.dispose()
+
+          val baos   = new ByteArrayOutputStream()
+          val writer = ImageIO.getImageWritersByFormatName("jpeg").next()
+          val param  = writer.getDefaultWriteParam
+          if (param.canWriteCompressed) {
+            param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT)
+            param.setCompressionQuality(quality)
+          }
+          val ios = new MemoryCacheImageOutputStream(baos)
+          writer.setOutput(ios)
+          try writer.write(null, new IIOImage(dst, null, null), param)
+          finally { writer.dispose(); ios.close() }
+          Some(baos.toByteArray)
+        }
+      }
+    }.toOption.flatten
+  }
 
   // Conservative allow-list. Anything else falls back to ".bin" — the
   // servlet still serves correctly because Content-Type comes from the

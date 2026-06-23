@@ -26,12 +26,18 @@ trait ApnsMessagingService {
    *  `articleId`, when present, is added as a top-level custom field next to
    *  `aps` so the app can deep-link to that article on tap. Broadcasts pass
    *  None (no single article).
+   *
+   *  `imageUrl`, when present, sets `mutable-content:1` and adds an `imageUrl`
+   *  custom field so the app's Notification Service Extension can attach a
+   *  thumbnail. OLD apps without the extension ignore both and render the
+   *  notification exactly as before — this is purely additive.
    */
   def sendBatch(
     tokens: List[String],
     title: String,
     body: String,
-    articleId: Option[String] = None
+    articleId: Option[String] = None,
+    imageUrl: Option[String] = None
   ): (Int, Int)
 }
 
@@ -68,10 +74,11 @@ class PushyApnsMessagingService(
     tokens: List[String],
     title: String,
     body: String,
-    articleId: Option[String] = None
+    articleId: Option[String] = None,
+    imageUrl: Option[String] = None
   ): (Int, Int) = {
     if (tokens.isEmpty) return (0, 0)
-    val payload = buildPayload(title, body, articleId)
+    val payload = buildPayload(title, body, articleId, imageUrl)
 
     val futures: List[(String, CompletableFuture[PushNotificationResponse[SimpleApnsPushNotification]])] =
       tokens.map { token =>
@@ -110,12 +117,24 @@ class PushyApnsMessagingService(
     (sent, failed)
   }
 
-  private def buildPayload(title: String, body: String, articleId: Option[String]): String = {
-    val aps = s""""aps":{"alert":{"title":"${escape(title)}","body":"${escape(body)}"},"sound":"default"}"""
+  private def buildPayload(
+    title: String,
+    body: String,
+    articleId: Option[String],
+    imageUrl: Option[String]
+  ): String = {
+    // mutable-content:1 wakes the Notification Service Extension so it can
+    // attach the image. Apps without the extension ignore it and display
+    // normally — safe for the old fleet.
+    val mutable = if (imageUrl.isDefined) ""","mutable-content":1""" else ""
+    val aps =
+      s""""aps":{"alert":{"title":"${escape(title)}","body":"${escape(body)}"},"sound":"default"$mutable}"""
     // Custom keys live alongside `aps` (APNs ignores them); the app reads
-    // userInfo["articleId"] on tap to deep-link to the article.
-    val extra = articleId.map(id => s""","articleId":"${escape(id)}"""").getOrElse("")
-    s"""{$aps$extra}"""
+    // userInfo["articleId"] on tap to deep-link, and userInfo["imageUrl"]
+    // in the extension to attach the thumbnail.
+    val articleField = articleId.map(id => s""","articleId":"${escape(id)}"""").getOrElse("")
+    val imageField   = imageUrl.map(u => s""","imageUrl":"${escape(u)}"""").getOrElse("")
+    s"""{$aps$articleField$imageField}"""
   }
 
   private def escape(s: String): String =

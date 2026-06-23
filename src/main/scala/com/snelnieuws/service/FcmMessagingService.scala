@@ -30,12 +30,17 @@ trait FcmMessagingService {
     *
     * `articleId`, when present, is attached to the message `data` map so the
     * app can deep-link to that article on tap. Broadcasts pass None.
+    *
+    * `imageUrl`, when present, is set on the FCM notification so the system
+    * renders a thumbnail (no client code needed; old apps render it in the
+    * tray too). Purely additive.
     */
   def sendBatch(
     tokens: List[String],
     title: String,
     body: String,
-    articleId: Option[String] = None
+    articleId: Option[String] = None,
+    imageUrl: Option[String] = None
   ): (Int, Int)
 }
 
@@ -92,10 +97,13 @@ class FirebaseFcmMessagingService(
     tokens: List[String],
     title: String,
     body: String,
-    articleId: Option[String] = None
+    articleId: Option[String] = None,
+    imageUrl: Option[String] = None
   ): (Int, Int) = {
     if (tokens.isEmpty) return (0, 0)
-    val notification = FcmNotification.builder().setTitle(title).setBody(body).build()
+    val notifBuilder = FcmNotification.builder().setTitle(title).setBody(body)
+    imageUrl.foreach(notifBuilder.setImage) // system renders the thumbnail
+    val notification = notifBuilder.build()
     val messaging    = FirebaseMessaging.getInstance()
 
     var sent   = 0

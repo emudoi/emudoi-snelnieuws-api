@@ -63,6 +63,25 @@ class ImageServlet(imageCacheService: ImageCacheService) extends ScalatraServlet
       BadRequest(Map("error" -> "missing image path"))
     } else if (rel == "_fallback") {
       serveFallback(longCache = true)
+    } else if (params.get("w").exists(_.forall(_.isDigit)) && params.get("w").exists(_.nonEmpty)) {
+      // Resized thumbnail (push-notification images). Returns a small JPEG,
+      // or 404 when the original isn't on disk yet / can't be decoded — we
+      // deliberately DON'T serve the ~1.5 MB fallback logo here, so a push
+      // image download is always tiny or absent.
+      val width = params("w").toInt
+      imageCacheService.readResized(rel, width) match {
+        case Right((bytes, contentTypeOpt)) =>
+          response.setHeader("Content-Type", contentTypeOpt.getOrElse("image/jpeg"))
+          response.setHeader("Cache-Control", LongCacheControl)
+          response.getOutputStream.write(bytes)
+          response.getOutputStream.flush()
+          ()
+        case Left(_: SecurityException) | Left(_: IllegalArgumentException) =>
+          BadRequest(Map("error" -> "invalid image path"))
+        case Left(_) =>
+          // Not downloaded yet, or undecodable source (WebP/AVIF/HEIC).
+          NotFound(Map("error" -> "thumbnail unavailable"))
+      }
     } else {
       imageCacheService.readBytes(rel) match {
         case Right((bytes, contentTypeOpt)) =>

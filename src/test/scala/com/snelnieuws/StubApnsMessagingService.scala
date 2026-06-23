@@ -13,7 +13,8 @@ class StubApnsMessagingService(
     tokens: List[String],
     title: String,
     body: String,
-    articleId: Option[String] = None
+    articleId: Option[String] = None,
+    imageUrl: Option[String] = None
   )
 
   private val recorded = mutable.ListBuffer.empty[SentBatch]
@@ -26,10 +27,11 @@ class StubApnsMessagingService(
     tokens: List[String],
     title: String,
     body: String,
-    articleId: Option[String] = None
+    articleId: Option[String] = None,
+    imageUrl: Option[String] = None
   ): (Int, Int) = {
     recorded.synchronized {
-      recorded += SentBatch(tokens, title, body, articleId)
+      recorded += SentBatch(tokens, title, body, articleId, imageUrl)
     }
     if (acceptAll) (tokens.size, 0)
     else {
