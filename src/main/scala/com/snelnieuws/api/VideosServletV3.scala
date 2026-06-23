@@ -113,9 +113,14 @@ class VideosServletV3(
   // playable stream + source-article link. Local table only (the legacy
   // marketing source has no persistent by-id record). Open — no gate — so a
   // shared link opens header-free, like the article deep link.
-  get("/:id") {
+  //
+  // DIGITS-ONLY route: Scalatra matches the most-recently-defined route first,
+  // so an unconstrained `/:id` would shadow `/feed` ("feed" → 404). Video ids
+  // are numeric (the ingestion render id), so a \d+ matcher both fixes that and
+  // is correct.
+  get("""/(\d+)""".r) {
     contentType = formats("json")
-    Try(params("id").toLong).toOption match {
+    Try(multiParams("captures").head.toLong).toOption match {
       case None => NotFound(Map("error" -> "invalid id"))
       case Some(id) =>
         videoRepository.findById(id) match {
