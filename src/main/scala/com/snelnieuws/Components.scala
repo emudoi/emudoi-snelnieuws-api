@@ -61,6 +61,7 @@ import com.snelnieuws.service.{
   SeoTrendsCleanupScheduler,
   SeoTrendsConsumer,
   SummarizedArticleConsumer,
+  VideoRenderConsumer,
   TrendingScoreService,
   UserService
 }
@@ -553,8 +554,41 @@ class Components(
     apiKey  = marketingApiKey
   )
 
+  lazy val videoRepository: com.snelnieuws.repository.VideoRepository =
+    new com.snelnieuws.repository.VideoRepository(provideTransactor)
+
   lazy val videoFeedService: VideoFeedService =
-    new VideoFeedService(marketingApiClient, appClientRepository)
+    new VideoFeedService(
+      marketingApiClient,
+      videoRepository,
+      appClientRepository,
+      feedSource = rootConfig.getString("videos.feed-source")
+    )
+
+  // Kafka consumer that fills the local `videos` table from ingestion-api's
+  // video_renders (topic snelnieuws.videos.rendered). Mirrors the article
+  // consumers; shares the one image cache + download worker.
+  lazy val videoRenderConsumer: Option[VideoRenderConsumer] = {
+    val kafkaCfg = com.snelnieuws.kafka.SummarizedImportKafkaConfig.loadVideo(rootConfig)
+    if (kafkaCfg.enabled) {
+      try Some(
+        new VideoRenderConsumer(
+          videoRepository     = videoRepository,
+          kafkaConfig         = kafkaCfg,
+          imageCacheService   = imageCacheService,
+          imageDownloadWorker = imageDownloadWorker
+        )
+      )
+      catch {
+        case e: Exception =>
+          logger.error(s"Failed to construct video-render consumer: ${e.getMessage}", e)
+          None
+      }
+    } else {
+      logger.info("Video-render Kafka consumer is disabled (kafka.video-import.enabled=false)")
+      None
+    }
+  }
 
   lazy val userSemanticQueryRepository: UserSemanticQueryRepository =
     new UserSemanticQueryRepository(provideTransactor)
@@ -581,6 +615,7 @@ class Components(
     new VideosServletV3(
       videoFeedService,
       marketingApiClient,
+      videoRepository,
       appClientRepository,
       imagesPublicBaseUrl
     )
@@ -623,6 +658,7 @@ class Components(
     imageCacheCleanupScheduler.foreach(_.start())
     summarizedArticleConsumer.foreach(_.start())
     eulangArticleConsumer.foreach(_.start())
+    videoRenderConsumer.foreach(_.start())
     seoTrendsConsumer.foreach(_.start())
     seoTrendsCleanupScheduler.foreach(_.start())
     imageRetrySlowConsumer.foreach(_.start())
@@ -638,6 +674,7 @@ class Components(
     // can land on the topic before the consumer's poll loop exits.
     summarizedArticleConsumer.foreach(_.stop())
     eulangArticleConsumer.foreach(_.stop())
+    videoRenderConsumer.foreach(_.stop())
     seoTrendsConsumer.foreach(_.stop())
     seoTrendsCleanupScheduler.foreach(_.stop())
     imageDownloadWorker.stop()

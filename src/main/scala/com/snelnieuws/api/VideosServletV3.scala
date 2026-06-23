@@ -20,7 +20,11 @@ case class VideoItemV3(
   stream_url:   String,
   duration_sec: Option[Double],
   title:        String,
-  variant:      String
+  variant:      String,
+  // Source article publisher link + image (local feed only; null for the
+  // legacy marketing source). `url` powers tap-to-article in the app.
+  url:          Option[String],
+  url_to_image: Option[String]
 )
 
 case class VideoFeedResponseV3(
@@ -43,6 +47,7 @@ case class VideoFeedResponseV3(
 class VideosServletV3(
   videoFeedService: VideoFeedService,
   marketingClient: MarketingApiClient,
+  videoRepository: com.snelnieuws.repository.VideoRepository,
   appClientRepository: AppClientRepository,
   publicBaseUrl: String
 ) extends ScalatraServlet
@@ -92,15 +97,7 @@ class VideosServletV3(
             videoFeedService.fetch(cid, limit) match {
               case Right((videos, hasMore)) =>
                 VideoFeedResponseV3(
-                  videos = videos.map { v =>
-                    VideoItemV3(
-                      id           = v.id.toString,
-                      stream_url   = s"$baseTrimmed/v3/videos/${v.id}/stream",
-                      duration_sec = v.durationSec,
-                      title        = v.title,
-                      variant      = v.variant
-                    )
-                  },
+                  videos = videos.map(toItem),
                   next_cursor = None,
                   has_more    = hasMore
                 )
@@ -111,6 +108,53 @@ class VideosServletV3(
         }
     }
   }
+
+  // ───────────────── Single video by id (shared links) ──────────────────
+  // The video analogue of articleV3(id): resolves a shared video id to its
+  // playable stream + source-article link. Local table only (the legacy
+  // marketing source has no persistent by-id record). Open — no gate — so a
+  // shared link opens header-free, like the article deep link.
+  get("/:id") {
+    contentType = formats("json")
+    Try(params("id").toLong).toOption match {
+      case None => NotFound(Map("error" -> "invalid id"))
+      case Some(id) =>
+        videoRepository.findById(id) match {
+          case Right(Some(v)) =>
+            VideoItemV3(
+              id           = v.id.toString,
+              stream_url   = v.streamUrl,
+              duration_sec = v.durationSec,
+              title        = v.title,
+              variant      = v.variant.getOrElse(""),
+              url          = v.url,
+              url_to_image = v.urlToImage.map(absolutize)
+            )
+          case Right(None) => NotFound(Map("error" -> "video not found"))
+          case Left(e) =>
+            logger.warn(s"video by-id $id failed: ${e.getMessage}")
+            InternalServerError(Map("error" -> "video lookup failed"))
+        }
+    }
+  }
+
+  /** Map a unified FeedVideo to the wire item. Local videos carry their CDN
+    * stream_url directly; marketing videos fall back to the proxy route. */
+  private def toItem(v: com.snelnieuws.service.FeedVideo): VideoItemV3 =
+    VideoItemV3(
+      id           = v.id.toString,
+      stream_url   = v.streamUrl.getOrElse(s"$baseTrimmed/v3/videos/${v.id}/stream"),
+      duration_sec = v.durationSec,
+      title        = v.title,
+      variant      = v.variant,
+      url          = v.url,
+      url_to_image = v.urlToImage.map(absolutize)
+    )
+
+  /** Relative /v2/images paths → absolute (so the app's image loader can fetch
+    * them directly), matching how article image URLs are served. */
+  private def absolutize(u: String): String =
+    if (u.startsWith("/")) s"$baseTrimmed$u" else u
 
   // ──────────────────────────── MP4 proxy ───────────────────────────────
 

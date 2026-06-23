@@ -26,6 +26,12 @@ object SummarizedImportKafkaConfig {
   def loadSeoTrends(config: Config = ConfigFactory.load()): SummarizedImportKafkaConfig =
     from(config.getConfig("kafka.seo-trends-import"))
 
+  /** Video-render import — the `kafka.video-import` block (topic
+    * snelnieuws.videos.rendered, separate consumer group). Reuses this shape;
+    * VideoRenderConsumer decodes the video event. */
+  def loadVideo(config: Config = ConfigFactory.load()): SummarizedImportKafkaConfig =
+    from(config.getConfig("kafka.video-import"))
+
   private def from(kafka: Config): SummarizedImportKafkaConfig =
     SummarizedImportKafkaConfig(
       bootstrapServers = kafka.getString("bootstrap-servers"),
