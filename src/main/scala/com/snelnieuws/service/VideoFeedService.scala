@@ -5,14 +5,11 @@ import org.slf4j.LoggerFactory
 
 import java.util.UUID
 
-/** A reel item, unified across the local-table source (the new, Kafka-fed
-  * `videos`) and the legacy marketing-api source. `streamUrl` is Some(cdn) for
-  * local videos (played directly) and None for marketing (the servlet builds
-  * its `/v3/videos/:id/stream` proxy URL). `url` is the source article's
-  * publisher link (local only) — powers tap-to-article. */
+/** A reel item. `streamUrl` is the public CDN mp4 (played directly); `url` is
+  * the source article's publisher link (tap-to-article). */
 case class FeedVideo(
   id:          Long,
-  streamUrl:   Option[String],
+  streamUrl:   String,
   durationSec: Option[Double],
   title:       String,
   variant:     String,
@@ -21,29 +18,20 @@ case class FeedVideo(
 )
 
 /** Per-client video reel feed with served-id rotation (mirrors the article
-  * feed). The catalogue comes from the local `videos` table when
-  * `feedSource = "local"` (the target: Kafka-fed, no upstream call), or the
-  * legacy marketing-api when `"marketing"` (transitional default, so the
-  * cutover deploy doesn't empty the reel before the table fills). */
+  * feed). Served entirely from the local `videos` table, which is fed from
+  * ingestion via Kafka — no upstream call. */
 class VideoFeedService(
-  marketingClient: MarketingApiClient,
   videoRepository: VideoRepository,
-  appClientRepository: AppClientRepository,
-  feedSource: String = "marketing"
+  appClientRepository: AppClientRepository
 ) {
 
   private val logger = LoggerFactory.getLogger(classOf[VideoFeedService])
 
   private def catalogue(): Either[Throwable, List[FeedVideo]] =
-    if (feedSource == "local")
-      videoRepository.listCatalogue().map(_.map { v =>
-        FeedVideo(v.id, Some(v.streamUrl), v.durationSec, v.title,
-                  v.variant.getOrElse(""), v.url, v.urlToImage)
-      })
-    else
-      marketingClient.listCompletedVideos().map(_.map { v =>
-        FeedVideo(v.id, None, v.durationSec, v.title, v.variant, None, None)
-      })
+    videoRepository.listCatalogue().map(_.map { v =>
+      FeedVideo(v.id, v.streamUrl, v.durationSec, v.title,
+                v.variant.getOrElse(""), v.url, v.urlToImage)
+    })
 
   /** Returns (videos for this page, hasMore). */
   def fetch(clientId: UUID, limit: Int): Either[Throwable, (List[FeedVideo], Boolean)] =

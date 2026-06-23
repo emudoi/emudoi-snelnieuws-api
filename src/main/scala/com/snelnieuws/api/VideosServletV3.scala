@@ -1,7 +1,7 @@
 package com.snelnieuws.api
 
 import com.snelnieuws.repository.AppClientRepository
-import com.snelnieuws.service.{MarketingApiClient, VideoFeedService}
+import com.snelnieuws.service.VideoFeedService
 import org.json4s.{DefaultFormats, Formats}
 import org.scalatra._
 import org.scalatra.json.JacksonJsonSupport
@@ -46,7 +46,6 @@ case class VideoFeedResponseV3(
   */
 class VideosServletV3(
   videoFeedService: VideoFeedService,
-  marketingClient: MarketingApiClient,
   videoRepository: com.snelnieuws.repository.VideoRepository,
   appClientRepository: AppClientRepository,
   publicBaseUrl: String
@@ -143,7 +142,7 @@ class VideosServletV3(
   private def toItem(v: com.snelnieuws.service.FeedVideo): VideoItemV3 =
     VideoItemV3(
       id           = v.id.toString,
-      stream_url   = v.streamUrl.getOrElse(s"$baseTrimmed/v3/videos/${v.id}/stream"),
+      stream_url   = v.streamUrl,
       duration_sec = v.durationSec,
       title        = v.title,
       variant      = v.variant,
@@ -156,63 +155,4 @@ class VideosServletV3(
   private def absolutize(u: String): String =
     if (u.startsWith("/")) s"$baseTrimmed$u" else u
 
-  // ──────────────────────────── MP4 proxy ───────────────────────────────
-
-  get("/:id/stream") {
-    Try(params("id").toLong).toOption match {
-      case None =>
-        NotFound(Map("error" -> "invalid id"))
-      case Some(id) =>
-        marketingClient.downloadFull(id) match {
-          case Left(e) =>
-            logger.warn(s"video stream id=$id failed: ${e.getMessage}")
-            NotFound(Map("error" -> "video unavailable"))
-          case Right(bytes) =>
-            val total = bytes.length
-            response.setHeader("Content-Type", "video/mp4")
-            response.setHeader("Accept-Ranges", "bytes")
-            response.setHeader("Cache-Control", "public, max-age=86400")
-            val out = response.getOutputStream
-            // Honour HTTP Range (iOS AVPlayer requires correct 206 behaviour).
-            parseRange(Option(request.getHeader("Range")), total) match {
-              case Some((start, end)) =>
-                val len = end - start + 1
-                response.setStatus(206)
-                response.setHeader("Content-Range", s"bytes $start-$end/$total")
-                response.setHeader("Content-Length", len.toString)
-                out.write(bytes, start, len)
-              case None =>
-                response.setStatus(200)
-                response.setHeader("Content-Length", total.toString)
-                out.write(bytes)
-            }
-            out.flush()
-            ()
-        }
-    }
-  }
-
-  /** Parse a single-range `bytes=start-end` (or `bytes=start-`, `bytes=-N`)
-    * header against `total`. Returns the inclusive (start, end) clamped to the
-    * file, or None when absent / multi-range / unsatisfiable. */
-  private def parseRange(header: Option[String], total: Int): Option[(Int, Int)] =
-    header.map(_.trim).filter(_.startsWith("bytes=")).flatMap { h =>
-      val spec = h.stripPrefix("bytes=")
-      if (spec.contains(",")) None // multi-range unsupported
-      else
-        Try {
-          if (spec.startsWith("-")) {
-            val n     = spec.drop(1).toInt
-            val start = math.max(0, total - n)
-            (start, total - 1)
-          } else {
-            val parts = spec.split("-", 2)
-            val start = parts(0).toInt
-            val end =
-              if (parts.length > 1 && parts(1).nonEmpty) math.min(parts(1).toInt, total - 1)
-              else total - 1
-            (start, end)
-          }
-        }.toOption.filter { case (s, e) => s >= 0 && e >= s && s < total }
-    }
 }

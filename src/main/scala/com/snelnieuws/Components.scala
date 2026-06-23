@@ -52,7 +52,6 @@ import com.snelnieuws.service.{
   IngestionApiClient,
   KafkaImageRetryProducer,
   KafkaUserEventsProducer,
-  MarketingApiClient,
   NotificationService,
   VideoFeedService,
   PushyApnsMessagingService,
@@ -538,32 +537,12 @@ class Components(
     internalApiKey = ingestionApiInternalKey
   )
 
-  // ⚠️ TEMPORARY / THROWAWAY — the video reel is an experiment against
-  // litikai-marketing-api that we plan to delete once the real video source
-  // lands. The X-API-Key is hard-coded on purpose: it's the same
-  // low-sensitivity key already committed in both apps' fastlane aso_sync,
-  // and wiring Vault for a soon-to-be-removed feature isn't worth it. When the
-  // experiment ends, delete this + the whole marketing-api/video wiring.
-  // (env override kept only for local dev.)
-  lazy val marketingApiKey: String =
-    sys.env.get("MARKETING_API_KEY").map(_.trim).filter(_.nonEmpty)
-      .getOrElse("w+QcnyJcjMlNxSqDRoTOgGurs9zJV7LwUyqQ6s7ofH0U+S6w")
-
-  lazy val marketingApiClient: MarketingApiClient = new MarketingApiClient(
-    baseUrl = rootConfig.getString("marketing-api.base-url"),
-    apiKey  = marketingApiKey
-  )
 
   lazy val videoRepository: com.snelnieuws.repository.VideoRepository =
     new com.snelnieuws.repository.VideoRepository(provideTransactor)
 
   lazy val videoFeedService: VideoFeedService =
-    new VideoFeedService(
-      marketingApiClient,
-      videoRepository,
-      appClientRepository,
-      feedSource = rootConfig.getString("videos.feed-source")
-    )
+    new VideoFeedService(videoRepository, appClientRepository)
 
   // Kafka consumer that fills the local `videos` table from ingestion-api's
   // video_renders (topic snelnieuws.videos.rendered). Mirrors the article
@@ -614,7 +593,6 @@ class Components(
   lazy val videosServletV3: VideosServletV3 =
     new VideosServletV3(
       videoFeedService,
-      marketingApiClient,
       videoRepository,
       appClientRepository,
       imagesPublicBaseUrl
