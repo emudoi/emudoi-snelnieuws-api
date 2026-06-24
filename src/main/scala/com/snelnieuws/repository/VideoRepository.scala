@@ -82,13 +82,16 @@ class VideoRepository(
     try Right(sql"DELETE FROM videos WHERE id = $id".update.run.transact(transactor).unsafeRunSync())
     catch { case e: Exception => logger.error(s"Failed to delete video id=$id: ${e.getMessage}", e); Left(e) }
 
-  /** Newest-first catalogue for the reel rotation (bounded). */
-  def listCatalogue(max: Int = 200): Either[Throwable, List[VideoRow]] =
+  /** Newest-first catalogue for the reel rotation (bounded), filtered to the
+    * user's language — the reel shows only videos in that language, like the
+    * article feed. */
+  def listCatalogue(language: String, max: Int = 200): Either[Throwable, List[VideoRow]] =
     try Right(
       sql"""
         SELECT id, title, description, stream_url, url, url_to_image, article_id,
                category, country, language, duration_sec, variant, published_at
         FROM videos
+        WHERE language = $language
         ORDER BY published_at DESC, id DESC
         LIMIT $max
       """.query[VideoRow].to[List].transact(transactor).unsafeRunSync()

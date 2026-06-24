@@ -93,7 +93,9 @@ class VideosServletV3(
               .flatMap(s => Try(s.toInt).toOption)
               .map(n => math.min(math.max(n, 1), MaxLimit))
               .getOrElse(DefaultLimit)
-            videoFeedService.fetch(cid, limit) match {
+            // Reel is filtered to the app's language, like the article feed.
+            val language = params.get("language").map(_.trim).filter(_.nonEmpty).getOrElse("en")
+            videoFeedService.fetch(cid, limit, language) match {
               case Right((videos, hasMore)) =>
                 VideoFeedResponseV3(
                   videos = videos.map(toItem),

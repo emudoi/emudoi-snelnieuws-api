@@ -27,16 +27,16 @@ class VideoFeedService(
 
   private val logger = LoggerFactory.getLogger(classOf[VideoFeedService])
 
-  private def catalogue(): Either[Throwable, List[FeedVideo]] =
-    videoRepository.listCatalogue().map(_.map { v =>
+  private def catalogue(language: String): Either[Throwable, List[FeedVideo]] =
+    videoRepository.listCatalogue(language).map(_.map { v =>
       FeedVideo(v.id, v.streamUrl, v.durationSec, v.title,
                 v.variant.getOrElse(""), v.url, v.urlToImage)
     })
 
-  /** Returns (videos for this page, hasMore). */
-  def fetch(clientId: UUID, limit: Int): Either[Throwable, (List[FeedVideo], Boolean)] =
+  /** Returns (videos for this page, hasMore). Filtered to `language`. */
+  def fetch(clientId: UUID, limit: Int, language: String): Either[Throwable, (List[FeedVideo], Boolean)] =
     for {
-      cat    <- catalogue()
+      cat    <- catalogue(language)
       served <- appClientRepository.readServedVideoIds(clientId)
       result <- {
         val unseen = cat.filterNot(v => served.contains(v.id))
