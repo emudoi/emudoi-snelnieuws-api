@@ -61,6 +61,21 @@ class VideosServletV3(
   private val MaxLimit       = 30
   private val baseTrimmed    = publicBaseUrl.stripSuffix("/")
 
+  // Bunny Stream pull-zone host for HLS playback. video_host_path is stored as
+  // the iframe EMBED url (.../play/<library>/<guid>) — an HTML player page that
+  // native players (ExoPlayer / AVPlayer) can't play. Convert it to the
+  // playable HLS playlist on the CDN. Idempotent: an already-HLS url passes
+  // through, so this stays correct if ingestion later emits HLS directly.
+  private val bunnyCdnHost  = sys.env.getOrElse("BUNNY_STREAM_CDN_HOST", "vz-3e759155-8bd.b-cdn.net")
+  private val BunnyIframeRe  = """https?://iframe\.mediadelivery\.net/(?:play|embed)/\d+/([0-9a-fA-F-]+)""".r.unanchored
+
+  private def playableUrl(stored: String): String =
+    if (stored.contains(".m3u8")) stored
+    else stored match {
+      case BunnyIframeRe(guid) => s"https://$bunnyCdnHost/$guid/playlist.m3u8"
+      case _                   => stored
+    }
+
   error {
     case e: Exception =>
       logger.error(s"Unhandled error: ${e.getMessage}", e)
@@ -129,7 +144,7 @@ class VideosServletV3(
           case Right(Some(v)) =>
             VideoItemV3(
               id           = v.id.toString,
-              stream_url   = v.streamUrl,
+              stream_url   = playableUrl(v.streamUrl),
               duration_sec = v.durationSec,
               title        = v.title,
               variant      = v.variant.getOrElse(""),
@@ -149,7 +164,7 @@ class VideosServletV3(
   private def toItem(v: com.snelnieuws.service.FeedVideo): VideoItemV3 =
     VideoItemV3(
       id           = v.id.toString,
-      stream_url   = v.streamUrl,
+      stream_url   = playableUrl(v.streamUrl),
       duration_sec = v.durationSec,
       title        = v.title,
       variant      = v.variant,
