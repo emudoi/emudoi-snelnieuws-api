@@ -69,6 +69,14 @@ class VideosServletV3(
   private val bunnyCdnHost  = sys.env.getOrElse("BUNNY_STREAM_CDN_HOST", "vz-3e759155-8bd.b-cdn.net")
   private val BunnyIframeRe  = """https?://iframe\.mediadelivery\.net/(?:play|embed)/\d+/([0-9a-fA-F-]+)""".r.unanchored
 
+  // Video availability is gated by country: the reel + shared-video links are
+  // only surfaced where policy permits. Defaults to the Netherlands only;
+  // override with VIDEOS_ALLOWED_COUNTRIES="nl,be" (comma-separated, lowercase
+  // ISO 3166-1 alpha-2). An empty value disables videos everywhere.
+  private val allowedVideoCountries: List[String] =
+    sys.env.getOrElse("VIDEOS_ALLOWED_COUNTRIES", "nl")
+      .split(",").map(_.trim.toLowerCase).filter(_.nonEmpty).toList
+
   private def playableUrl(stored: String): String =
     if (stored.contains(".m3u8")) stored
     else stored match {
@@ -157,6 +165,16 @@ class VideosServletV3(
             InternalServerError(Map("error" -> "video lookup failed"))
         }
     }
+  }
+
+  // ──────────────── Allowed countries (video availability) ───────────────
+  // OPEN config endpoint the apps poll to decide whether to surface the video
+  // reel + swipe-up affordance at all. Driven by VIDEOS_ALLOWED_COUNTRIES
+  // (default "nl"). The app compares its effective country (lowercase) against
+  // this list. Returns {"allowed_countries":["nl"]}.
+  get("/allowed-countries") {
+    contentType = formats("json")
+    Map("allowed_countries" -> allowedVideoCountries)
   }
 
   /** Map a unified FeedVideo to the wire item. Local videos carry their CDN
