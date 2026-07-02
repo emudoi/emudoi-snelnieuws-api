@@ -223,16 +223,19 @@ class NewsServletV2(
   }
 
   get("/app/config") {
-    Map("minVersion" -> "1.5.1")
+    Map("minVersion" -> "2.0.0")
   }
 
   // Android force-upgrade gate. Compared as Int against BuildConfig.VERSION_CODE
   // in the app, so any client with versionCode < minVersionCode is shown the
   // force-update screen. minVersionName is informational only (shown in UI / logs).
+  // NOTE: the current Android client gates on /app/config's minVersion string
+  // (not this endpoint), so these values are kept accurate but have no runtime
+  // effect. versionCode 157 == the 2.0.0 build.
   get("/app/config/android") {
     Map(
-      "minVersionCode" -> 152,
-      "minVersionName" -> "1.5.1"
+      "minVersionCode" -> 157,
+      "minVersionName" -> "2.0.0"
     )
   }
 
