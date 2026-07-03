@@ -33,21 +33,35 @@ class VideoFeedService(
                 v.variant.getOrElse(""), v.url, v.urlToImage)
     })
 
-  /** Returns (videos for this page, hasMore). Filtered to `language`. */
+  /** Returns (videos for this page, hasMore). Filtered to `language`.
+    *
+    * The reel is an ENDLESS newest-first loop. We serve the client's unseen
+    * videos a page at a time; when they run out we reset the rotation and start
+    * again from the newest. `hasMore` reflects "the reel can keep going" — true
+    * whenever the catalogue is larger than a single page — rather than "unseen
+    * videos remain". That way the current apps (which stop paginating the moment
+    * they see hasMore=false) never dead-end on a short final page: they simply
+    * fetch the next page, which wraps back to the top. The only time hasMore is
+    * false is when the whole catalogue fits in one page (nothing to page to) or
+    * there are no videos at all. */
   def fetch(clientId: UUID, limit: Int, language: String): Either[Throwable, (List[FeedVideo], Boolean)] =
     for {
       cat    <- catalogue(language)
       served <- appClientRepository.readServedVideoIds(clientId)
       result <- {
-        val unseen = cat.filterNot(v => served.contains(v.id))
+        // A full catalogue means the reel can always advance to a next page
+        // (either more unseen, or a wrap back to the newest). Constant across
+        // both branches so the client keeps looping instead of stopping.
+        val hasMore = cat.size > limit
+        val unseen  = cat.filterNot(v => served.contains(v.id))
         if (unseen.nonEmpty) {
           val page = unseen.take(limit)
-          appClientRepository.appendServedVideoIds(clientId, page.map(_.id)).map(_ => (page, unseen.size > page.size))
+          appClientRepository.appendServedVideoIds(clientId, page.map(_.id)).map(_ => (page, hasMore))
         } else {
-          // Exhausted — reset rotation and serve from the top again.
+          // Exhausted — reset rotation and loop from the newest again.
           val page = cat.take(limit)
-          logger.debug(s"video feed exhausted for client=$clientId; resetting rotation")
-          appClientRepository.setServedVideoIds(clientId, page.map(_.id)).map(_ => (page, cat.size > page.size))
+          logger.debug(s"video feed exhausted for client=$clientId; looping rotation from newest")
+          appClientRepository.setServedVideoIds(clientId, page.map(_.id)).map(_ => (page, hasMore))
         }
       }
     } yield result
