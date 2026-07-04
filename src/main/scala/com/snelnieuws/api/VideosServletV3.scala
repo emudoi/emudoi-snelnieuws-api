@@ -100,7 +100,13 @@ class VideosServletV3(
 
   get("/feed") {
     contentType = formats("json")
-    clientIdFromHeader() match {
+    // Hard server-side kill switch: when VIDEOS_ALLOWED_COUNTRIES is empty the
+    // feature is disabled everywhere, so serve an empty reel regardless of the
+    // client. The /allowed-countries config endpoint alone isn't enough — apps
+    // may cache it or hit the feed directly, so we enforce it here too.
+    if (allowedVideoCountries.isEmpty) {
+      VideoFeedResponseV3(videos = Nil, next_cursor = None, has_more = false)
+    } else clientIdFromHeader() match {
       case None =>
         Unauthorized(Map("error" -> "missing or invalid X-Client / X-Client-Key"))
       case Some(cid) =>
@@ -145,7 +151,10 @@ class VideosServletV3(
   // is correct.
   get("""/(\d+)""".r) {
     contentType = formats("json")
-    Try(multiParams("captures").head.toLong).toOption match {
+    // Same kill switch as /feed: with the feature disabled, shared video deep
+    // links resolve to "not found" so playback is impossible anywhere.
+    if (allowedVideoCountries.isEmpty) NotFound(Map("error" -> "video not found"))
+    else Try(multiParams("captures").head.toLong).toOption match {
       case None => NotFound(Map("error" -> "invalid id"))
       case Some(id) =>
         videoRepository.findById(id) match {
