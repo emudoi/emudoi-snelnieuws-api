@@ -161,12 +161,12 @@ spec:
             # events into the wrong topic.
             - name: IMAGES_SLOW_RETRY_TOPIC
               value: "image-retry-slow"
-            # Video feature kill switch. An empty allow-list disables the
-            # reel everywhere: /v3/videos/allowed-countries returns [] so the
-            # apps hide the reel + swipe-up affordance. Set back to "nl" (or
-            # remove this env to fall back to the "nl" default) to re-enable.
+            # Video availability by country (lowercase ISO 3166-1 alpha-2,
+            # comma-separated). "nl" = reel enabled in the Netherlands. An
+            # empty value is the kill switch: /feed returns empty, by-id
+            # returns not-found, and /allowed-countries returns [].
             - name: VIDEOS_ALLOWED_COUNTRIES
-              value: ""
+              value: "nl"
           volumeMounts:
             - name: images
               mountPath: /data/images
