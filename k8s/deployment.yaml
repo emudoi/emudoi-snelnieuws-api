@@ -161,6 +161,12 @@ spec:
             # events into the wrong topic.
             - name: IMAGES_SLOW_RETRY_TOPIC
               value: "image-retry-slow"
+            # Video feature kill switch. An empty allow-list disables the
+            # reel everywhere: /v3/videos/allowed-countries returns [] so the
+            # apps hide the reel + swipe-up affordance. Set back to "nl" (or
+            # remove this env to fall back to the "nl" default) to re-enable.
+            - name: VIDEOS_ALLOWED_COUNTRIES
+              value: ""
           volumeMounts:
             - name: images
               mountPath: /data/images

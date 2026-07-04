@@ -434,14 +434,15 @@ class ArticleService(
     category    = row.category
   )
 
-  /** Stored values starting with `/` are server-relative paths (the new
-    * caching scheme); prepend the configured base URL so the response
-    * carries an absolute URL. Legacy absolute URLs flow through unchanged.
-    * Empty configured base URL is allowed (used in tests) — relative paths
-    * stay relative, which integration tests can still match exactly. */
-  private def absolutiseStoredUrl(stored: Option[String]): Option[String] = stored.map { v =>
-    if (v.startsWith("/")) publicBaseUrl + v else v
-  }
+  /** Temporarily forced to the bundled default/fallback image for every
+    * article: we are not serving news images at all right now. The stored
+    * `url_to_image` is intentionally ignored so no source or cached image
+    * URL ever leaves the API. Revert to the commented logic below to
+    * restore real news images. */
+  private def absolutiseStoredUrl(stored: Option[String]): Option[String] =
+    Some(publicBaseUrl + "/v2/images/_fallback")
+    // Original behaviour (restore to re-enable news images):
+    // stored.map { v => if (v.startsWith("/")) publicBaseUrl + v else v }
 
   /** Decide what to write into articles.url_to_image and what (if anything)
     * to enqueue for download. */

@@ -647,14 +647,15 @@ class NewsServletV3(
     else Left(s"invalid language: '$raw'; must be a 2-letter lowercase code")
   }
 
-  /** Stored values starting with `/` are server-relative paths from the
-    * v2 image-cache scheme (`/v2/images/...`); prepend the configured
-    * base URL so the response carries an absolute URL. Legacy absolute
-    * URLs flow through unchanged. Same logic as
-    * `ArticleService.absolutiseStoredUrl`. */
-  private def absolutiseImage(stored: Option[String]): Option[String] = stored.map { v =>
-    if (v.startsWith("/")) imagesPublicBaseUrl + v else v
-  }
+  /** Temporarily forced to the bundled default/fallback image for every
+    * article: we are not serving news images at all right now. The stored
+    * `url_to_image` is intentionally ignored so no source or cached image
+    * URL ever leaves the API. Revert to the commented logic below to
+    * restore real news images. */
+  private def absolutiseImage(stored: Option[String]): Option[String] =
+    Some(imagesPublicBaseUrl + "/v2/images/_fallback")
+    // Original behaviour (restore to re-enable news images):
+    // stored.map { v => if (v.startsWith("/")) imagesPublicBaseUrl + v else v }
 }
 
 // Top-level case classes so json4s emits stable field names without needing
