@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/name: snelnieuws-api
     app.kubernetes.io/managed-by: argocd
 spec:
-  replicas: 1
+  replicas: 0  # snelnieuws shut down 2026-09-30 (data kept); set back to 1 to restore
   selector:
     matchLabels:
       app.kubernetes.io/name: snelnieuws-api

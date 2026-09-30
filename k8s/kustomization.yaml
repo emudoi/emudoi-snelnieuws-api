@@ -13,7 +13,7 @@ resources:
   - ingress.yaml
   - provisioning.yaml
   - pvc.yaml
-  - monitoring.yaml
+  # - monitoring.yaml  # disabled while snelnieuws is shut down (2026-09-30)
 # image-updater appends/updates the entry below with `digest: sha256:...`
 # whenever it observes a new digest on the watched tag. Kept here as a
 # single-source-of-truth for the deployed image so manual edits stay in
